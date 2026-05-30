@@ -1,25 +1,45 @@
+import os
 import sys
 import subprocess
 import logging
-from PyQt6.QtCore import QThread, pyqtSignal, QObject
+import tempfile
 
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+from PyQt6.QtCore import QObject, pyqtSignal
+
+from core.constants import DATA_DIR
+
+logger = logging.getLogger(__name__)
 
 
 class Signals(QObject):
-    """Signals to communicate between threads and the main UI."""
-    output_received = pyqtSignal(str)
+    """Signals to communicate between worker threads and the main UI."""
+
+    output_received = pyqtSignal(str, str)  # message, message_type
     error_received = pyqtSignal(str)
 
 
-class CodeRunnerThread(QThread):
-    def __init__(self, file_path, input_value, signals, timeout=5):
-        super().__init__()
+class CodeRunner:
+    """Runs a Python script from a worker thread (ThreadPoolExecutor)."""
+
+    DEFAULT_TIMEOUT = 30
+
+    def __init__(self, file_path, input_value="", signals=None, timeout=None):
         self.file_path = file_path
-        self.input_value = input_value
-        self.signals = signals
-        self.timeout = timeout
+        self.input_value = input_value or ""
+        self.signals = signals or Signals()
+        self.timeout = timeout if timeout is not None else self.DEFAULT_TIMEOUT
         self.process = None
+        self._temp_file = None
+
+    @classmethod
+    def from_source(cls, source, signals=None, timeout=None):
+        """Write source to a temp file and return a runner for that file."""
+        fd, path = tempfile.mkstemp(suffix=".py", dir=DATA_DIR, text=True)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(source)
+        runner = cls(path, signals=signals, timeout=timeout)
+        runner._temp_file = path
+        return runner
 
     def run(self):
         try:
@@ -28,39 +48,53 @@ class CodeRunnerThread(QThread):
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True
+                text=True,
+                cwd=os.path.dirname(self.file_path) or None,
             )
 
             try:
-                output, error = self.process.communicate(input=self.input_value, timeout=self.timeout)
+                stdout, stderr = self.process.communicate(
+                    input=self.input_value, timeout=self.timeout
+                )
             except subprocess.TimeoutExpired:
-                self.process.kill()
-                output, error = self.process.communicate()
+                self.kill()
+                stdout, stderr = self.process.communicate()
+                stderr = (stderr or "") + f"\nProcess timed out after {self.timeout}s."
 
-            if output:
-                self.signals.output_received.emit(output)
-            if error:
-                self.signals.error_received.emit(error)
+            if stdout:
+                self.signals.output_received.emit(stdout.rstrip(), "info")
+            if stderr:
+                self.signals.error_received.emit(stderr.rstrip())
 
-        except Exception as e:
-            self.signals.error_received.emit(f"Exception occurred: {str(e)}")
+        except Exception as exc:
+            logger.exception("Code execution failed")
+            self.signals.error_received.emit(str(exc))
         finally:
-            self._terminate_and_cleanup()
+            self._cleanup()
 
-    def _terminate_and_cleanup(self):
-        if self.process:
+    def kill(self):
+        if self.process and self.process.poll() is None:
             try:
-                if self.process.poll() is None:
-                    self.process.terminate()
-                    self.process.wait(3)
+                self.process.kill()
+            except OSError as exc:
+                logger.warning("Could not kill process: %s", exc)
+
+    def _cleanup(self):
+        if self.process and self.process.poll() is None:
+            try:
+                self.process.terminate()
+                self.process.wait(3)
             except subprocess.TimeoutExpired:
                 self.process.kill()
-            finally:
-                self.process = None
+        self.process = None
 
-    def stop(self):
-        if self.process and self.process.poll() is None:
-            self.process.terminate()
-            self.process.wait()
-        self.quit()
-        self.wait()
+        if self._temp_file and os.path.exists(self._temp_file):
+            try:
+                os.remove(self._temp_file)
+            except OSError as exc:
+                logger.warning("Could not remove temp file %s: %s", self._temp_file, exc)
+            self._temp_file = None
+
+
+# Backward-compatible aliases
+CodeRunnerThread = CodeRunner

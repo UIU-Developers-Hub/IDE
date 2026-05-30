@@ -1,683 +1,1275 @@
-import sys
-import os
 import json
 import logging
-from PyQt6.QtCore import QTimer, QThread
+import os
+import sys
+
+import jedi
 from concurrent.futures import ThreadPoolExecutor
-from PyQt6.QtWidgets import (
-    QMainWindow, QTabWidget, QPlainTextEdit, QFileDialog,
-    QVBoxLayout, QWidget, QHBoxLayout, QSplitter, QTreeView,
-    QLineEdit, QStatusBar, QDockWidget, QApplication, QMenu, 
-    QInputDialog, QMessageBox, QToolBar, QFontDialog, QTextEdit
+from PyQt6.QtCore import Qt, QThread, QFileSystemWatcher, QSize
+from PyQt6.QtGui import (
+    QAction, QColor, QFont, QKeySequence, QShortcut, QTextCharFormat,
+    QTextCursor,
 )
-from PyQt6.QtGui import QFont, QAction, QShortcut, QKeySequence, QFileSystemModel, QTextCursor
-from PyQt6.QtCore import Qt, QThreadPool
+from PyQt6.QtWidgets import (
+    QApplication, QFileDialog, QHBoxLayout, QInputDialog,
+    QLineEdit, QMainWindow, QMenu, QMessageBox, QPlainTextEdit,
+    QSplitter, QStatusBar, QTabBar, QTabWidget, QToolButton, QVBoxLayout,
+    QWidget, QFontDialog, QLabel,
+)
 
-from ui.toolbar import Toolbar
-from core.code_runner_thread import CodeRunnerThread, Signals
-from ui.documentation_sidebar import DocumentationSidebar
-from ui.code_editor import CodeEditor
+from core.code_runner_thread import CodeRunner, Signals
+from core.constants import (
+    BATCH_RESULTS_PATH, RECENT_FILES_PATH, SESSION_PATH, SETTINGS_PATH,
+)
 from core.debugger_thread import DebuggerThread
+from core.format_worker import FormatWorker
+from ui.command_palette import CommandPalette
+from ui.activity_bar import ActivityBar
+from ui.bottom_panel import BottomPanel
+from ui.code_editor import CodeEditor
+from ui.dialogs import FindReplaceDialog, GoToLineDialog
+from ui.documentation_sidebar import DocumentationSidebar
+from ui.problems_panel import ProblemsPanel
+from ui.quick_open import QuickOpenDialog
+from ui.side_bar import SideBar
+from ui.terminal_panel import TerminalPanel
+from ui.welcome_widget import WelcomeWidget
+from core.git_service import GitService
+from ui.theme import ERROR, WARNING, SIDEBAR_WIDTH
+from ui.icons_util import icon
 
-# Set Jedi's log level to suppress debug messages
-logging.getLogger('jedi').setLevel(logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logging.getLogger("jedi").setLevel(logging.WARNING)
+logger = logging.getLogger(__name__)
+
+OUTPUT_COLORS = {
+    "error": "#f44747",
+    "warning": "#cca700",
+    "info": "#d4d4d4",
+}
+
 
 class AICompilerMainWindow(QMainWindow):
-    RECENT_FILES_LIMIT = 5
-    RECENT_FILES_PATH = "recent_files.json"
-    SETTINGS_PATH = "user_settings.json"
-    SESSION_PATH = "last_session.json"
+    RECENT_FILES_LIMIT = 10
 
     def __init__(self):
         super().__init__()
+        self.setWindowTitle("PyDitor")
+        self.resize(1200, 800)
 
-        # Create the main widget and layout
-        main_widget = QWidget()
-        layout = QVBoxLayout()
-
-        # Create and add the CodeEditor to the layout
-        self.editor = CodeEditor()
-        layout.addWidget(self.editor)
-
-        # Set the layout and the central widget
-        main_widget.setLayout(layout)
-        self.setCentralWidget(main_widget)
-
-        self.setWindowTitle("Python IDE")
-
-        self.thread_pool = ThreadPoolExecutor(max_workers=5)
-        self.threads = []
-        self.previous_tab_index = None
-        self.modified_tabs = set()
-        self.unsaved_tab_open = False
-        self.tab_process_map = {}
-
-        logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+        self.thread_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="runner")
+        self.debugger_thread = None
+        self.active_runner = None
+        self.recent_files = []
+        self._last_lint_data = []
+        self.format_worker = None
+        self._project_root = os.getcwd()
+        self._welcome_tab_index = None
+        self._sidebar_visible = True
+        self._panel_visible = True
+        self._last_activity = ActivityBar.EXPLORER
+        self._untitled_seq = 0
+        self._docs_visible = False
 
         self.setup_ui()
+        self.setup_menu_bar()
         self.setup_shortcuts()
+        self.load_user_settings()
         self.restore_session()
+        self._sync_untitled_counter()
+        if self.tab_widget.count() == 0:
+            self.show_welcome_tab()
 
     def setup_ui(self):
-        self.setStyleSheet("background-color: #1e1e1e; color: #ffffff;")
         self.recent_files = self.load_recent_files()
 
-        # Initialize Toolbar
-        self.toolbar = Toolbar(self)
-        self.addToolBar(self.toolbar)
+        self.activity_bar = ActivityBar(self)
+        self.activity_bar.view_changed.connect(self._on_activity_view)
 
-        # Add the Batch Test button to the toolbar
-        self.batch_test_action = QAction("Batch Test", self)
-        self.batch_test_action.triggered.connect(self.run_batch_test)
-        self.toolbar.addAction(self.batch_test_action)
+        self.setup_status_bar()
 
-        # Add Debugger Controls
-        self.debugger_toolbar = QToolBar("Debugger", self)
-        self.addToolBar(self.debugger_toolbar)
+        self.side_bar = SideBar(self)
+        self.side_bar.set_root(self._project_root)
+        self.explorer_panel = self.side_bar.explorer_panel
 
-        self.start_debugger_action = QAction("Start Debugger", self)
-        self.start_debugger_action.triggered.connect(self.start_debugger)
-        self.debugger_toolbar.addAction(self.start_debugger_action)
+        self.fs_watcher = QFileSystemWatcher(self)
+        self.fs_watcher.fileChanged.connect(self._on_external_file_changed)
+        self._watch_directory(self._project_root)
 
-        self.continue_debugger_action = QAction("Continue", self)
-        self.continue_debugger_action.triggered.connect(self.continue_debugger)
-        self.debugger_toolbar.addAction(self.continue_debugger_action)
+        self.tab_widget = QTabWidget()
+        self.tab_widget.setDocumentMode(True)
+        self.tab_widget.setTabsClosable(False)
+        self.tab_widget.setMovable(True)
+        tab_bar = self.tab_widget.tabBar()
+        tab_bar.setExpanding(False)
+        tab_bar.setElideMode(Qt.TextElideMode.ElideRight)
+        tab_bar.setDrawBase(False)
+        self.tab_widget.currentChanged.connect(self._on_tab_changed)
 
-        self.step_debugger_action = QAction("Step", self)
-        self.step_debugger_action.triggered.connect(self.step_debugger)
-        self.debugger_toolbar.addAction(self.step_debugger_action)
+        self.setup_bottom_panel()
 
-        # Initialize documentation sidebar
         self.documentation_sidebar = DocumentationSidebar()
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.documentation_sidebar)
+        self.documentation_sidebar.hide()
 
-        # File Explorer setup
-        self.file_explorer = QTreeView()
-        self.file_model = QFileSystemModel()
-        self.file_model.setRootPath('')
-        self.file_explorer.setModel(self.file_model)
-        self.file_explorer.setRootIndex(self.file_model.index(''))
-        self.file_explorer.clicked.connect(self.open_file_from_explorer)
+        editor_splitter = QSplitter(Qt.Orientation.Vertical)
+        editor_splitter.addWidget(self.tab_widget)
+        editor_splitter.addWidget(self.bottom_panel)
+        editor_splitter.setStretchFactor(0, 1)
+        editor_splitter.setStretchFactor(1, 0)
+        editor_splitter.setSizes([700, 220])
+        self._editor_splitter = editor_splitter
 
-        # Create Splitters and Layouts
-        left_splitter = QSplitter(Qt.Orientation.Horizontal)
-        left_splitter.addWidget(self.file_explorer)
-
-        # Tab Widget for Code Editor
-        self.tab_widget = QTabWidget()
-        self.tab_widget.setTabsClosable(True)
-        self.tab_widget.setMovable(True)
-        self.tab_widget.tabCloseRequested.connect(self.close_tab)
-        self.tab_widget.currentChanged.connect(self.on_tab_changed)
-
-        # Add an initial tab
-        self.add_new_tab()
-
-        # Layout for the right-hand side splitter
-        right_splitter = QSplitter(Qt.Orientation.Vertical)
-        right_splitter.addWidget(self.tab_widget)
-        left_splitter.addWidget(right_splitter)
+        # Activity bar sits outside the splitter — fixed width, never draggable.
+        self._main_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self._main_splitter.addWidget(self.side_bar)
+        self._main_splitter.addWidget(editor_splitter)
+        self._main_splitter.setStretchFactor(0, 0)
+        self._main_splitter.setStretchFactor(1, 1)
+        self._main_splitter.setSizes([SIDEBAR_WIDTH, 900])
+        self._main_splitter.setCollapsible(0, False)
+        self._main_splitter.setChildrenCollapsible(False)
 
         central_widget = QWidget()
-        main_layout = QHBoxLayout(central_widget)
-        main_layout.addWidget(left_splitter)
+        layout = QHBoxLayout(central_widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addWidget(self.activity_bar)
+        layout.addWidget(self._main_splitter)
         self.setCentralWidget(central_widget)
 
-        self.setup_io_tabs(right_splitter)
+        self.update_git_status()
+        self.bottom_panel.tab_changed.connect(self._on_bottom_panel_tab_changed)
 
-        # Initialize and set the QStatusBar
-        self.setStatusBar(QStatusBar())
+    def setup_bottom_panel(self):
+        self.bottom_panel = BottomPanel()
+        self.bottom_panel.connect_close(self.toggle_bottom_panel)
 
-    def setup_io_tabs(self, right_splitter):
-        """Set up Input/Output tabs in the right splitter with active tab font color in green."""
-        self.io_tabs = QTabWidget()
-        self.io_tabs.setTabsClosable(False)
+        self.problems_panel = ProblemsPanel()
+        self.problems_panel.issue_activated.connect(self._go_to_problem)
+        self._panel_problems_index = self.bottom_panel.add_tab(
+            self.problems_panel, "Problems",
+        )
 
-        # Input field setup
-        self.input_field = QLineEdit()
-        self.input_field.setStyleSheet("background-color: #2e2e2e; color: #abb2bf; padding: 10px;")
-        self.input_field.setPlaceholderText("Input for the script...")
-        self.io_tabs.addTab(self.input_field, "Input")
-
-        # Output field setup using QPlainTextEdit for plain text output
-        self.output_text = QPlainTextEdit()  # Ensure this is QPlainTextEdit for appending text
+        output_container = QWidget()
+        output_layout = QVBoxLayout(output_container)
+        output_layout.setContentsMargins(0, 0, 0, 0)
+        self.output_text = QPlainTextEdit()
         self.output_text.setReadOnly(True)
-        self.output_text.setStyleSheet("background-color: #2e2e2e; color: #abb2bf; padding: 10px;")
-        self.io_tabs.addTab(self.output_text, "Output")
+        output_layout.addWidget(self.output_text)
+        self._panel_output_index = self.bottom_panel.add_tab(
+            output_container, "Output", on_clear=self.clear_output,
+        )
 
-        # Connect to the currentChanged signal to handle the tab change
-        self.io_tabs.currentChanged.connect(self.update_tab_style)
+        self.input_field = QLineEdit()
+        self.input_field.setPlaceholderText("Program input (stdin)...")
+        self.bottom_panel.add_tab(self.input_field, "Input")
 
-        # Container and layout setup
-        io_container = QWidget()
-        io_layout = QVBoxLayout(io_container)
-        io_layout.addWidget(self.io_tabs)
-        right_splitter.addWidget(io_container)
+        self.terminal_panel = TerminalPanel(self)
+        self._panel_terminal_index = self.bottom_panel.add_tab(
+            self.terminal_panel, "Terminal",
+            on_clear=self.clear_terminal,
+        )
 
-    def update_tab_style(self):
-        """Update the font color of the active tab to green and reset the inactive tabs."""
-        for i in range(self.io_tabs.count()):
-            if i == self.io_tabs.currentIndex():
-                # Active tab, set font color to green
-                self.io_tabs.tabBar().setTabTextColor(i, Qt.GlobalColor.green)
-            else:
-                # Inactive tabs, set font color to default (white/grey)
-                self.io_tabs.tabBar().setTabTextColor(i, Qt.GlobalColor.white)
+        self.io_tabs = self.bottom_panel.stack
 
-    def setup_shortcuts(self):
-        """Set up unique keyboard shortcuts."""
-        QShortcut(QKeySequence("Ctrl+Shift+N"), self, activated=self.add_new_tab)
-        QShortcut(QKeySequence("Ctrl+O"), self, activated=self.open_file)
-        QShortcut(QKeySequence("Ctrl+S"), self, activated=self.save_file)
-        QShortcut(QKeySequence("Ctrl+Shift+R"), self, activated=self.run_code)
-        QShortcut(QKeySequence("Ctrl+T"), self, activated=self.run_tests)
-
-    def restore_session(self):
-        """Restore the last open session with all tabs and contents."""
-        if os.path.exists(self.SESSION_PATH):
-            try:
-                with open(self.SESSION_PATH, 'r') as session_file:
-                    session_data = json.load(session_file)
-
-                    for file_info in session_data.get("open_files", []):
-                        content = file_info["content"]
-                        file_path = file_info["file_path"]
-
-                        new_editor = CodeEditor()
-                        new_editor.setPlainText(content)
-                        new_editor.file_path = file_path
-                        tab_index = self.tab_widget.addTab(new_editor, os.path.basename(file_path) if file_path else "Untitled")
-                        self.tab_widget.setCurrentIndex(tab_index)
-
-                    self.tab_widget.setCurrentIndex(session_data.get("current_tab_index", 0))
-
-            except Exception as e:
-                print(f"Failed to restore session: {str(e)}")
-
-    def add_new_tab(self):
-        """Add a new code editor tab."""
-        if self.unsaved_tab_open:
-            self.statusBar().showMessage("Error: Please save your current file before opening a new one!", 5000)
+    def _on_activity_view(self, index):
+        if self._sidebar_visible and self._last_activity == index:
+            self.toggle_side_bar(force_hide=True)
             return
+        self._last_activity = index
+        self._sidebar_visible = True
+        self.side_bar.show()
+        self.side_bar.show_view(index)
+        self.activity_bar.set_active(index)
 
-        new_editor = CodeEditor()
-        new_editor.file_path = None
-        new_editor.setFont(QFont("Courier New", 14))
-        tab_index = self.tab_widget.addTab(new_editor, "Untitled")
-        self.tab_widget.setCurrentIndex(tab_index)
+    def toggle_side_bar(self, force_hide=None):
+        if force_hide is True:
+            self._sidebar_visible = False
+        elif force_hide is False:
+            self._sidebar_visible = True
+        else:
+            self._sidebar_visible = not self._sidebar_visible
+        self.side_bar.setVisible(self._sidebar_visible)
 
-        self.unsaved_tab_open = True
-        self.statusBar().showMessage("New tab opened. Please save your work before creating a new tab.", 5000)
+    def toggle_bottom_panel(self):
+        self._panel_visible = not self._panel_visible
+        self.bottom_panel.setVisible(self._panel_visible)
 
-    def close_tab(self, index):
-        """Close a tab and ensure proper cleanup."""
-        current_editor = self.tab_widget.widget(index)
-        if isinstance(current_editor, CodeEditor):
-            if current_editor.document().isModified() or current_editor.file_path is None:
-                reply = QMessageBox.question(self, 'Unsaved Changes', 
-                                             "This document has unsaved changes. Do you want to save them?", 
-                                             QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Discard | QMessageBox.StandardButton.Cancel)
-                if reply == QMessageBox.StandardButton.Save:
-                    if not self.save_file():
-                        return  # If saving fails, do not close the tab
-                elif reply == QMessageBox.StandardButton.Cancel:
-                    return  # User canceled the operation
+    def show_terminal_panel(self):
+        if not self._panel_visible:
+            self.toggle_bottom_panel()
+        self.bottom_panel.set_current_index(self._panel_terminal_index)
+        self.terminal_panel._ensure_terminal()
+        widget = self.terminal_panel.tabs.currentWidget()
+        if widget:
+            widget.start()
+            widget.input.setFocus()
 
-        if current_editor.file_path is None:
-            self.unsaved_tab_open = False
+    def toggle_terminal(self):
+        if self._panel_visible and self.bottom_panel.current_index() == self._panel_terminal_index:
+            self.toggle_bottom_panel()
+        else:
+            self.show_terminal_panel()
 
-        self.cleanup_tab_process(index)
-        self.tab_widget.removeTab(index)
+    def clear_terminal(self):
+        self.terminal_panel.clear_current()
 
-    def cleanup_tab_process(self, index):
-        """Terminate and cleanup any process or temp file associated with a tab."""
-        if index in self.tab_process_map:
-            process, temp_file = self.tab_process_map[index]
+    def _on_bottom_panel_tab_changed(self, index):
+        if index == self._panel_output_index:
+            self.bottom_panel.set_clear_callback(self.clear_output)
+        elif index == self._panel_terminal_index:
+            self.bottom_panel.set_clear_callback(self.clear_terminal)
 
-            if process and process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(3)
-                except subprocess.TimeoutExpired:
-                    process.kill()
+    def update_git_status(self):
+        if not hasattr(self, "_status_git"):
+            return
+        git = GitService(self._project_root)
+        if git.is_repo():
+            branch = git.current_branch() or "main"
+            self._status_git.setText(f"⎇ {branch}")
+        else:
+            self._status_git.setText("— no git")
 
-            if temp_file and os.path.exists(temp_file):
-                try:
-                    os.remove(temp_file)
-                except Exception as e:
-                    logging.error(f"Failed to delete temp file '{temp_file}': {e}")
+    def open_folder_at(self, folder):
+        if not folder or not os.path.isdir(folder):
+            return
+        self._project_root = folder
+        self.side_bar.set_root(folder)
+        self.terminal_panel.set_project_root(folder)
+        self._status_project.setText(os.path.basename(folder))
+        self._watch_directory(folder)
+        self.update_git_status()
+        self.side_bar.source_control_panel.refresh()
+        self.statusBar().showMessage(f"Opened folder: {folder}", 3000)
 
-            del self.tab_process_map[index]
+    def show_output_panel(self):
+        if not self._panel_visible:
+            self.toggle_bottom_panel()
+        self.bottom_panel.set_current_index(self._panel_output_index)
 
-    def run_code(self):
-        """Run the code from the current editor and show the output tab automatically."""
-        current_editor = self.tab_widget.currentWidget()
+    def setup_status_bar(self):
+        status = QStatusBar()
+        self.setStatusBar(status)
+        self._status_project = QLabel(os.path.basename(self._project_root))
+        self._status_git = QLabel("—")
+        self._status_lint = QLabel("✓ 0")
+        self._status_position = QLabel("Ln 1, Col 1")
+        self._status_encoding = QLabel("UTF-8")
+        self._status_language = QLabel(
+            f"Python {sys.version_info.major}.{sys.version_info.minor}"
+        )
+        for widget in (
+            self._status_project,
+            self._status_git,
+            self._status_lint,
+            self._status_position,
+            self._status_encoding,
+            self._status_language,
+        ):
+            widget.setStyleSheet("color: #ffffff; padding: 0 8px;")
+        status.addWidget(self._status_project)
+        status.addWidget(self._status_git)
+        status.addPermanentWidget(self._status_lint)
+        status.addPermanentWidget(self._status_position)
+        status.addPermanentWidget(self._status_encoding)
+        status.addPermanentWidget(self._status_language)
 
-        if isinstance(current_editor, CodeEditor):
-            if not current_editor.file_path:
-                self.statusBar().showMessage("Error: Please save the file before running.", 5000)
-                reply = QMessageBox.warning(self, 'Save File',
-                                            "The file is not saved. Do you want to save it before running?",
-                                            QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Cancel)
-                if reply == QMessageBox.StandardButton.Save:
-                    if not self.save_file():
-                        return  # If saving fails
-                else:
-                    return  # User cancels the run
-            elif current_editor.document().isModified():
-                reply = QMessageBox.warning(self, 'Unsaved Changes',
-                                            "The file has unsaved changes. Do you want to save them before running?",
-                                            QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Cancel)
-                if reply == QMessageBox.StandardButton.Save:
-                    if not self.save_file():
-                        return  # If saving fails
-                else:
-                    return  # User cancels the run
+    def setup_menu_bar(self):
+        mb = self.menuBar()
 
-            file_path = current_editor.file_path
-            self.statusBar().showMessage(f"Running: {file_path}", 3000)
+        file_menu = mb.addMenu("&File")
+        for label, shortcut, slot in (
+            ("&New File", "Ctrl+N", self.add_new_tab),
+            ("&Open File...", "Ctrl+O", self.open_file),
+            ("&Quick Open...", "Ctrl+P", self.show_quick_open),
+            ("Command &Palette...", "Ctrl+Shift+P", self.show_command_palette),
+            ("&Save", "Ctrl+S", self.save_file),
+            ("Save &As...", "Ctrl+Shift+S", self.save_file_as),
+            ("Open &Folder...", "Ctrl+Shift+O", self.open_folder),
+            ("&Recent Files", None, self.show_recent_files),
+        ):
+            action = QAction(label, self)
+            if shortcut:
+                action.setShortcut(shortcut)
+            action.triggered.connect(slot)
+            file_menu.addAction(action)
+        file_menu.addSeparator()
+        exit_action = QAction("E&xit", self)
+        exit_action.setShortcut("Ctrl+Q")
+        exit_action.triggered.connect(QApplication.instance().quit)
+        file_menu.addAction(exit_action)
 
-            # Clear previous output before running
-            self.output_text.clear()
+        edit_menu = mb.addMenu("&Edit")
+        for label, shortcut, slot in (
+            ("&Find", "Ctrl+F", self.show_find_dialog),
+            ("&Replace", "Ctrl+H", self.show_replace_dialog),
+            ("&Go to Line", "Ctrl+G", self.show_go_to_line),
+            ("Toggle &Comment", "Ctrl+/", self.toggle_comment),
+            ("&Format Document", "Shift+Alt+F", self.format_document),
+            ("Organize &Imports", "Ctrl+Alt+I", self.organize_imports),
+        ):
+            action = QAction(label, self)
+            action.setShortcut(shortcut)
+            action.triggered.connect(slot)
+            edit_menu.addAction(action)
 
-            # Switch to the "Output" tab automatically
-            self.io_tabs.setCurrentIndex(1)
+        run_menu = mb.addMenu("&Run")
+        for label, shortcut, slot in (
+            ("&Run File", "F5", self.run_code),
+            ("&Stop", "Shift+F5", self.stop_execution),
+            ("Run &Buffer", "Ctrl+T", self.run_tests),
+        ):
+            action = QAction(label, self)
+            action.setShortcut(shortcut)
+            action.triggered.connect(slot)
+            run_menu.addAction(action)
 
-            signals = Signals()
-            signals.output_received.connect(self.handle_output)
-            signals.error_received.connect(self.handle_error)
+        debug_menu = mb.addMenu("&Debug")
+        for label, slot in (
+            ("Start Debugger", self.start_debugger),
+            ("Continue", self.continue_debugger),
+            ("Step", self.step_debugger),
+        ):
+            action = QAction(label, self)
+            action.triggered.connect(slot)
+            debug_menu.addAction(action)
 
-            runnable = CodeRunnerThread(file_path, self.input_field.text().strip(), signals)
-            self.thread_pool.submit(runnable.run)
+        git_menu = mb.addMenu("&Git")
+        for label, shortcut, slot in (
+            ("&Source Control", "Ctrl+Shift+G", lambda: self._show_activity(ActivityBar.SOURCE_CONTROL)),
+            ("&Commit...", "Ctrl+Enter", self._git_commit_prompt),
+            ("&Push", "Ctrl+Shift+K", self._git_push),
+            ("P&ull", "Ctrl+Shift+U", self._git_pull),
+            ("&Refresh Status", None, self._git_refresh),
+            ("Clone Repository...", None, self.side_bar.source_control_panel.clone_repo),
+            ("Publish to GitHub...", None, self.side_bar.source_control_panel.publish_github),
+        ):
+            action = QAction(label, self)
+            if shortcut:
+                action.setShortcut(shortcut)
+            action.triggered.connect(slot)
+            git_menu.addAction(action)
 
-    def run_tests(self):
-        """Run unit tests from the current editor."""
-        current_editor = self.tab_widget.currentWidget()
-        if isinstance(current_editor, CodeEditor):
-            code = current_editor.toPlainText()
+        view_menu = mb.addMenu("&View")
+        for label, shortcut, slot in (
+            ("&Explorer", "Ctrl+Shift+E", lambda: self._show_activity(ActivityBar.EXPLORER)),
+            ("&Search", "Ctrl+Shift+F", lambda: self._show_activity(ActivityBar.SEARCH)),
+            ("Source &Control", "Ctrl+Shift+G", lambda: self._show_activity(ActivityBar.SOURCE_CONTROL)),
+            ("&Run and Debug", None, lambda: self._show_activity(ActivityBar.RUN)),
+            ("&Terminal", "Ctrl+`", self.toggle_terminal),
+            ("New &Terminal", "Ctrl+Shift+`", self.new_terminal),
+            ("Toggle &Documentation", "Ctrl+Shift+I", self.toggle_documentation),
+            ("Toggle &Side Bar", "Ctrl+B", self.toggle_side_bar),
+            ("Toggle &Panel", "Ctrl+J", self.toggle_bottom_panel),
+            ("Show &Problems", "Ctrl+Shift+M", self.show_problems_panel),
+            ("Clear &Output", None, self.clear_output),
+        ):
+            action = QAction(label, self)
+            if shortcut:
+                action.setShortcut(shortcut)
+            action.triggered.connect(slot)
+            view_menu.addAction(action)
 
-            if not code.strip():
-                self.statusBar().showMessage("Error: No tests to run!", 3000)
+    def _show_activity(self, index):
+        self._on_activity_view(index)
+
+    def new_terminal(self):
+        self.terminal_panel.new_terminal(self._project_root)
+        self.show_terminal_panel()
+
+    def _git_commit_prompt(self):
+        self._show_activity(ActivityBar.SOURCE_CONTROL)
+        self.side_bar.source_control_panel.commit_input.setFocus()
+
+    def _git_push(self):
+        self._show_activity(ActivityBar.SOURCE_CONTROL)
+        self.side_bar.source_control_panel.push()
+
+    def _git_pull(self):
+        self._show_activity(ActivityBar.SOURCE_CONTROL)
+        self.side_bar.source_control_panel.pull()
+
+    def _git_refresh(self):
+        self._show_activity(ActivityBar.SOURCE_CONTROL)
+        self.side_bar.source_control_panel.refresh()
+        self.update_git_status()
+
+    def show_command_palette(self):
+        dialog = CommandPalette(self)
+        dialog.exec()
+
+    def toggle_documentation(self):
+        self._docs_visible = not self._docs_visible
+        if self._docs_visible:
+            self.documentation_sidebar.show()
+            editor = self.current_editor()
+            if editor:
+                self.update_documentation(editor)
+        else:
+            self.documentation_sidebar.hide()
+
+    def _sync_untitled_counter(self):
+        max_n = 0
+        for index in range(self.tab_widget.count()):
+            editor = self.tab_widget.widget(index)
+            if isinstance(editor, CodeEditor) and not editor.file_path:
+                name = getattr(editor, "untitled_name", "")
+                if name.startswith("Untitled-"):
+                    try:
+                        max_n = max(max_n, int(name.split("-", 1)[1]))
+                    except ValueError:
+                        pass
+        self._untitled_seq = max_n
+
+    def _next_untitled_name(self):
+        self._untitled_seq += 1
+        return f"Untitled-{self._untitled_seq}"
+
+    def _add_tab_close_button(self, index):
+        bar = self.tab_widget.tabBar()
+        btn = QToolButton()
+        btn.setIcon(icon("close", "#969696"))
+        btn.setIconSize(QSize(12, 12))
+        btn.setFixedSize(20, 20)
+        btn.setToolTip("Close (Ctrl+W)")
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setStyleSheet(
+            "QToolButton { background: transparent; border: none; border-radius: 3px; }"
+            "QToolButton:hover { background: #3e3e42; }"
+        )
+        btn.clicked.connect(self._on_tab_close_clicked)
+        bar.setTabButton(index, QTabBar.ButtonPosition.RightSide, btn)
+
+    def _on_tab_close_clicked(self):
+        bar = self.tab_widget.tabBar()
+        button = self.sender()
+        for i in range(bar.count()):
+            if bar.tabButton(i, QTabBar.ButtonPosition.RightSide) is button:
+                self.close_tab(i)
                 return
 
-            signals = Signals()
-            signals.output_received.connect(self.handle_output)
-            signals.error_received.connect(self.handle_error)
+    def show_welcome_tab(self):
+        if self._welcome_tab_index is not None:
+            self.tab_widget.setCurrentIndex(self._welcome_tab_index)
+            return
+        welcome = WelcomeWidget(self)
+        self._welcome_tab_index = self.tab_widget.addTab(welcome, "Welcome")
+        self._add_tab_close_button(self._welcome_tab_index)
+        self.tab_widget.setCurrentIndex(self._welcome_tab_index)
 
-            test_runnable = CodeRunnerThread(code, "", signals)
-            self.thread_pool.submit(test_runnable.run)
+    def close_welcome_tab(self):
+        if self._welcome_tab_index is None:
+            return
+        for index in range(self.tab_widget.count()):
+            if isinstance(self.tab_widget.widget(index), WelcomeWidget):
+                self.tab_widget.removeTab(index)
+                break
+        self._welcome_tab_index = None
 
-            self.io_tabs.setCurrentIndex(1)
+    def show_quick_open(self):
+        dialog = QuickOpenDialog(self._project_root, self)
+        if dialog.exec() and dialog.selected_path():
+            self._open_file_path(dialog.selected_path())
 
-    def handle_output(self, output, message_type="info"):
-        """Handle the output received and display it with appropriate colors in the output tab."""
-        self.output_text.moveCursor(QTextCursor.MoveOperation.End)  # Move cursor to the end
+    def clear_output(self):
+        self.output_text.clear()
+        self.statusBar().showMessage("Output cleared.", 2000)
 
-        # Determine color based on the message type
-        if message_type == "error":
-            color = "red"
-        elif message_type == "warning":
-            color = "yellow"
-        else:
-            color = "white"  # Default to white for info messages
+    def show_problems_panel(self):
+        if not self._panel_visible:
+            self.toggle_bottom_panel()
+        self.bottom_panel.set_current_index(self._panel_problems_index)
 
-        # Insert the message into the output field with the selected color
-        self.output_text.insertPlainText(f'{output}\n')  # For plain text output
+    def _go_to_problem(self, line, _text):
+        editor = self.current_editor()
+        if editor:
+            editor.go_to_line(line)
 
-    def handle_error(self, error):
-        """Handle the error received from running the tests or code."""
-        self.append_output(error)
+    def setup_shortcuts(self):
+        QShortcut(QKeySequence("Ctrl+N"), self, activated=self.add_new_tab)
+        QShortcut(QKeySequence("Ctrl+O"), self, activated=self.open_file)
+        QShortcut(QKeySequence("Ctrl+S"), self, activated=self.save_file)
+        QShortcut(QKeySequence("Ctrl+Shift+S"), self, activated=self.save_file_as)
+        QShortcut(QKeySequence("Ctrl+W"), self, activated=self.close_current_tab)
+        QShortcut(QKeySequence("F5"), self, activated=self.run_code)
+        QShortcut(QKeySequence("Shift+F5"), self, activated=self.stop_execution)
+        QShortcut(QKeySequence("Ctrl+T"), self, activated=self.run_tests)
+        QShortcut(QKeySequence("Ctrl+F"), self, activated=self.show_find_dialog)
+        QShortcut(QKeySequence("Ctrl+H"), self, activated=self.show_replace_dialog)
+        QShortcut(QKeySequence("Ctrl+G"), self, activated=self.show_go_to_line)
+        QShortcut(QKeySequence("Ctrl+/"), self, activated=self.toggle_comment)
+        QShortcut(QKeySequence("Ctrl+B"), self, activated=self.toggle_side_bar)
+        QShortcut(QKeySequence("Ctrl+J"), self, activated=self.toggle_bottom_panel)
+        QShortcut(QKeySequence("Ctrl+Shift+E"), self, activated=lambda: self._show_activity(ActivityBar.EXPLORER))
+        QShortcut(QKeySequence("Ctrl+Shift+F"), self, activated=lambda: self._show_activity(ActivityBar.SEARCH))
+        QShortcut(QKeySequence("Ctrl+Shift+G"), self, activated=lambda: self._show_activity(ActivityBar.SOURCE_CONTROL))
+        QShortcut(QKeySequence("Ctrl+`"), self, activated=self.toggle_terminal)
+        QShortcut(QKeySequence("Ctrl+Shift+`"), self, activated=self.new_terminal)
+        QShortcut(QKeySequence("Ctrl+Enter"), self, activated=self._git_commit_prompt)
+        QShortcut(QKeySequence("Ctrl+Shift+M"), self, activated=self.show_problems_panel)
+        QShortcut(QKeySequence("Ctrl+Shift+P"), self, activated=self.show_command_palette)
+        QShortcut(QKeySequence("Ctrl+Shift+I"), self, activated=self.toggle_documentation)
+        QShortcut(QKeySequence("Ctrl+P"), self, activated=self.show_quick_open)
+        QShortcut(QKeySequence("Ctrl+Shift+L"), self, activated=self.show_lint_report)
+        QShortcut(QKeySequence("Shift+Alt+F"), self, activated=self.format_document)
+        QShortcut(QKeySequence("Ctrl+Alt+I"), self, activated=self.organize_imports)
 
-    def open_file(self):
-        """Open a file using a file dialog."""
-        file_path, _ = QFileDialog.getOpenFileName(self, "Open Python File", "", "Python Files (*.py);;All Files (*)")
-        if file_path:
-            self.load_file(file_path)
-            self.add_to_recent_files(file_path)
+    def _watch_directory(self, folder):
+        if not folder or not os.path.isdir(folder):
+            return
+        current = self.fs_watcher.directories()
+        if current:
+            self.fs_watcher.removePaths(current)
+        self.fs_watcher.addPath(folder)
 
-    def load_recent_files(self):
-        """Load recent files list from a JSON file."""
-        if os.path.exists(self.RECENT_FILES_PATH):
-            try:
-                with open(self.RECENT_FILES_PATH, 'r') as file:
-                    return json.load(file)
-            except json.JSONDecodeError as e:
-                logging.error(f"Error loading recent files: {str(e)}")
-                return []
-        return []
+    def _on_external_file_changed(self, path):
+        if not os.path.isfile(path):
+            return
+        for index in range(self.tab_widget.count()):
+            editor = self.tab_widget.widget(index)
+            if not isinstance(editor, CodeEditor) or editor.file_path != path:
+                continue
+            if not editor.document().isModified():
+                self._reload_editor_from_disk(editor, path)
+                return
+            reply = QMessageBox.question(
+                self,
+                "File Changed",
+                f"{os.path.basename(path)} was modified externally.\nReload?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                self._reload_editor_from_disk(editor, path)
+            return
 
-    def load_file(self, file_path):
-        """Load a file's content into a new editor tab."""
-        with open(file_path, "r") as file:
-            content = file.read()
-        new_editor = CodeEditor()
-        new_editor.setPlainText(content)
-        new_editor.file_path = file_path
-        tab_index = self.tab_widget.addTab(new_editor, os.path.basename(file_path))
-        self.tab_widget.setCurrentIndex(tab_index)
-        self.statusBar().showMessage(f"Opened: {file_path}", 3000)
+    def _reload_editor_from_disk(self, editor, path):
+        try:
+            with open(path, encoding="utf-8") as handle:
+                editor.setPlainText(handle.read())
+            editor.document().setModified(False)
+            self.update_tab_title(editor)
+            self.statusBar().showMessage(f"Reloaded: {path}", 3000)
+        except OSError as exc:
+            self.statusBar().showMessage(f"Reload failed: {exc}", 5000)
 
-    def save_file(self):
-        """Save the current file's content."""
-        current_editor = self.tab_widget.currentWidget()
-        if isinstance(current_editor, CodeEditor):
-            if current_editor.file_path is None:
-                file_path, _ = QFileDialog.getSaveFileName(self, "Save Python File", "", "Python Files (*.py);;All Files (*)")
-                if file_path:
-                    current_editor.file_path = file_path
+    def _on_tab_changed(self, _index):
+        editor = self.current_editor()
+        if editor:
+            self.update_documentation(editor)
+            self.update_status_bar(editor)
+            self.update_tab_title(editor)
+
+    def update_status_bar(self, editor):
+        line, col = editor.getCursorPosition()
+        self._status_position.setText(f"Ln {line + 1}, Col {col + 1}")
+        project = os.path.basename(self._project_root)
+        self._status_project.setText(project)
+        self._update_window_title(editor)
+
+    def update_tab_title(self, editor):
+        for index in range(self.tab_widget.count()):
+            if self.tab_widget.widget(index) is editor:
+                if editor.file_path:
+                    base = os.path.basename(editor.file_path)
                 else:
-                    self.statusBar().showMessage("Error: File not saved.", 5000)
-                    return False
+                    base = getattr(editor, "untitled_name", "Untitled-1")
+                suffix = " ●" if editor.document().isModified() else ""
+                self.tab_widget.setTabText(index, base + suffix)
+                break
+        self._update_window_title(editor)
 
-            try:
-                with open(current_editor.file_path, "w") as file:
-                    file.write(current_editor.toPlainText())
-                self.add_to_recent_files(current_editor.file_path)
-                self.statusBar().showMessage(f"Saved: {current_editor.file_path}", 3000)
-                current_editor.document().setModified(False)
-                return True
-            except Exception as e:
-                self.statusBar().showMessage(f"Error saving {current_editor.file_path}: {str(e)}", 5000)
+    def _update_window_title(self, editor):
+        if editor.file_path:
+            fname = os.path.basename(editor.file_path)
+        else:
+            fname = getattr(editor, "untitled_name", "Untitled-1")
+        modified = " ●" if editor.document().isModified() else ""
+        project = os.path.basename(self._project_root)
+        self.setWindowTitle(f"{fname}{modified} - {project} - PyDitor")
+
+    def current_editor(self):
+        widget = self.tab_widget.currentWidget()
+        return widget if isinstance(widget, CodeEditor) else None
+
+    def update_documentation(self, editor):
+        if not self._docs_visible:
+            return
+
+        cursor = editor.textCursor()
+        line = cursor.blockNumber() + 1
+        column = cursor.positionInBlock()
+        source = editor.toPlainText()
+
+        if not source.strip():
+            return
+
+        try:
+            script = jedi.Script(code=source, path=editor.file_path or "<stdin>")
+            names = script.help(line, column)
+            if not names:
+                return
+            doc = names[0].docstring()
+            if not doc:
+                desc = str(names[0].description or "")
+                if not desc or desc in ("None", "NoneType", "instance"):
+                    return
+                doc = desc
+            self.documentation_sidebar.set_widget_content(doc)
+        except Exception as exc:
+            logger.debug("Documentation lookup failed: %s", exc)
+
+    def add_new_tab(self, file_path=None, content=""):
+        self.close_welcome_tab()
+        editor = CodeEditor(main_window=self)
+        editor.file_path = file_path
+        if not file_path:
+            editor.untitled_name = self._next_untitled_name()
+        if content:
+            editor.setPlainText(content)
+            editor.document().setModified(False)
+
+        title = (
+            os.path.basename(file_path) if file_path else editor.untitled_name
+        )
+        index = self.tab_widget.addTab(editor, title)
+        self._add_tab_close_button(index)
+        self.tab_widget.setCurrentIndex(index)
+        editor.document().modificationChanged.connect(
+            lambda _modified: self.update_tab_title(editor)
+        )
+        self.update_status_bar(editor)
+        return editor
+
+    def close_current_tab(self):
+        self.close_tab(self.tab_widget.currentIndex())
+
+    def close_tab(self, index):
+        widget = self.tab_widget.widget(index)
+        if isinstance(widget, WelcomeWidget):
+            self.tab_widget.removeTab(index)
+            self._welcome_tab_index = None
+            return
+
+        editor = widget
+        if not isinstance(editor, CodeEditor):
+            self.tab_widget.removeTab(index)
+            if self.tab_widget.count() == 0:
+                self.show_welcome_tab()
+            return
+
+        if editor.document().isModified():
+            reply = QMessageBox.question(
+                self,
+                "Unsaved Changes",
+                "Save changes before closing?",
+                QMessageBox.StandardButton.Save
+                | QMessageBox.StandardButton.Discard
+                | QMessageBox.StandardButton.Cancel,
+            )
+            if reply == QMessageBox.StandardButton.Save:
+                previous = self.tab_widget.currentIndex()
+                self.tab_widget.setCurrentIndex(index)
+                if not self.save_file():
+                    self.tab_widget.setCurrentIndex(previous)
+                    return
+            elif reply == QMessageBox.StandardButton.Cancel:
+                return
+
+        editor.close()
+        self.tab_widget.removeTab(index)
+        if self.tab_widget.count() == 0:
+            self.show_welcome_tab()
+
+    def _ensure_saved(self, editor):
+        if editor.file_path and not editor.document().isModified():
+            return True
+
+        if not editor.file_path:
+            self.statusBar().showMessage("Save the file before running.", 4000)
+            reply = QMessageBox.warning(
+                self,
+                "Save File",
+                "The file must be saved before running. Save now?",
+                QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Cancel,
+            )
+            if reply != QMessageBox.StandardButton.Save:
+                return False
+        elif editor.document().isModified():
+            reply = QMessageBox.warning(
+                self,
+                "Unsaved Changes",
+                "Save changes before running?",
+                QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Cancel,
+            )
+            if reply != QMessageBox.StandardButton.Save:
                 return False
 
-    def add_to_recent_files(self, file_path):
-        """Add a file path to the recent files list."""
-        if not hasattr(self, 'recent_files'):
-            self.recent_files = []
+        return self.save_file()
 
-        if file_path not in self.recent_files:
-            self.recent_files.insert(0, file_path)
-            if len(self.recent_files) > self.RECENT_FILES_LIMIT:
-                self.recent_files.pop()
-            self.save_recent_files()
+    def run_code(self):
+        editor = self.current_editor()
+        if not editor:
+            return
+
+        if not self._ensure_saved(editor):
+            return
+
+        self.output_text.clear()
+        self.show_output_panel()
+        self.statusBar().showMessage(f"Running: {editor.file_path}", 3000)
+
+        signals = Signals()
+        signals.output_received.connect(self.handle_output)
+        signals.error_received.connect(lambda msg: self.handle_output(msg, "error"))
+
+        runner = CodeRunner(
+            editor.file_path,
+            self.input_field.text(),
+            signals=signals,
+        )
+        self.active_runner = runner
+        self.thread_pool.submit(self._run_and_clear, runner)
+
+    def _run_and_clear(self, runner):
+        try:
+            runner.run()
+        finally:
+            self.active_runner = None
+
+    def stop_execution(self):
+        if self.active_runner:
+            self.active_runner.kill()
+            self.handle_output("Execution stopped.", "warning")
+            self.statusBar().showMessage("Execution stopped.", 3000)
+        elif self.debugger_thread and self.debugger_thread.isRunning():
+            self.debugger_thread.stop()
+            self.handle_output("Debugger stopped.", "warning")
+            self.statusBar().showMessage("Debugger stopped.", 3000)
+        else:
+            self.statusBar().showMessage("Nothing is running.", 2000)
+
+    def run_tests(self):
+        editor = self.current_editor()
+        if not editor or not editor.toPlainText().strip():
+            self.statusBar().showMessage("No code to run.", 3000)
+            return
+
+        self.output_text.clear()
+        self.show_output_panel()
+
+        signals = Signals()
+        signals.output_received.connect(self.handle_output)
+        signals.error_received.connect(lambda msg: self.handle_output(msg, "error"))
+
+        runner = CodeRunner.from_source(editor.toPlainText(), signals=signals)
+        self.active_runner = runner
+        self.thread_pool.submit(self._run_and_clear, runner)
+
+    def handle_output(self, message, message_type="info"):
+        cursor = self.output_text.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+
+        fmt = QTextCharFormat()
+        fmt.setForeground(QColor(OUTPUT_COLORS.get(message_type, OUTPUT_COLORS["info"])))
+        cursor.setCharFormat(fmt)
+        cursor.insertText(message.rstrip() + "\n")
+        self.output_text.setTextCursor(cursor)
+        self.output_text.ensureCursorVisible()
+
+    def process_lint_results(self, lint_data):
+        self._last_lint_data = lint_data or []
+        self.problems_panel.update_issues(self._last_lint_data)
+
+        if not lint_data:
+            self._status_lint.setText("✓ 0")
+            self._status_lint.setStyleSheet("color: #ffffff; padding: 0 8px;")
+            self.statusBar().showMessage("No lint issues.", 3000)
+            return
+
+        errors = sum(
+            1 for item in lint_data
+            if item["message"].split()[0].startswith(("E", "F"))
+        )
+        warnings = len(lint_data) - errors
+        self._status_lint.setText(f"ⓧ {errors}  ⚠ {warnings}")
+        color = ERROR if errors else (WARNING if warnings else "#ffffff")
+        self._status_lint.setStyleSheet(f"color: {color}; padding: 0 8px;")
+        self.statusBar().showMessage(
+            f"Lint: {errors} error(s), {warnings} warning(s)  (Ctrl+Shift+L for details)",
+            5000,
+        )
+
+    def show_lint_report(self):
+        if not self._last_lint_data:
+            self.statusBar().showMessage("No lint results yet.", 3000)
+            return
+        self.show_problems_panel()
+
+    def show_find_dialog(self):
+        self._show_find_replace(replace=False)
+
+    def show_replace_dialog(self):
+        self._show_find_replace(replace=True)
+
+    def _show_find_replace(self, replace=False):
+        editor = self.current_editor()
+        if not editor:
+            return
+
+        dialog = FindReplaceDialog(self, replace=replace)
+
+        selected = editor.textCursor().selectedText().replace("\u2029", "\n")
+        if selected and "\n" not in selected:
+            dialog.find_input.setText(selected)
+
+        while True:
+            result = dialog.exec()
+            if result == 0:
+                break
+
+            find = dialog.search_text()
+            if not find:
+                continue
+
+            case = dialog.is_case_sensitive()
+            if result == 1:
+                if not editor.find_text(find, case_sensitive=case):
+                    self.statusBar().showMessage(f"Not found: {find}", 3000)
+            elif result == 2:
+                if not editor.find_text(find, backward=True, case_sensitive=case):
+                    self.statusBar().showMessage(f"Not found: {find}", 3000)
+            elif result == 3:
+                editor.replace_current(
+                    find, dialog.replacement_text(), case_sensitive=case
+                )
+            elif result == 4:
+                count = editor.replace_all(
+                    find, dialog.replacement_text(), case_sensitive=case
+                )
+                self.statusBar().showMessage(f"Replaced {count} occurrence(s).", 3000)
+                break
+
+    def show_go_to_line(self):
+        editor = self.current_editor()
+        if not editor:
+            return
+
+        current = editor.textCursor().blockNumber() + 1
+        maximum = editor.blockCount()
+        dialog = GoToLineDialog(self, current_line=current, max_line=maximum)
+        if dialog.exec() and dialog.line_number() is not None:
+            line = dialog.line_number()
+            if 1 <= line <= maximum:
+                editor.go_to_line(line)
+            else:
+                self.statusBar().showMessage(f"Line must be between 1 and {maximum}.", 4000)
+
+    def toggle_comment(self):
+        editor = self.current_editor()
+        if editor:
+            editor.toggle_comment()
+
+    def open_file(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Open Python File", os.getcwd(), "Python Files (*.py);;All Files (*)"
+        )
+        if file_path:
+            self._open_file_path(file_path)
+
+    def _open_file_path(self, file_path):
+        for index in range(self.tab_widget.count()):
+            editor = self.tab_widget.widget(index)
+            if isinstance(editor, CodeEditor) and editor.file_path == file_path:
+                self.tab_widget.setCurrentIndex(index)
+                self.statusBar().showMessage(f"Already open: {file_path}", 2000)
+                return
+
+        try:
+            with open(file_path, encoding="utf-8") as handle:
+                content = handle.read()
+        except OSError as exc:
+            self.statusBar().showMessage(f"Could not open file: {exc}", 5000)
+            return
+
+        self.add_new_tab(file_path=file_path, content=content)
+        self.add_to_recent_files(file_path)
+        self.statusBar().showMessage(f"Opened: {file_path}", 3000)
+
+    def load_recent_files(self):
+        if not os.path.exists(RECENT_FILES_PATH):
+            return []
+        try:
+            with open(RECENT_FILES_PATH, encoding="utf-8") as handle:
+                files = json.load(handle)
+            return [path for path in files if os.path.isfile(path)][: self.RECENT_FILES_LIMIT]
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning("Could not load recent files: %s", exc)
+            return []
+
+    def save_file(self):
+        editor = self.current_editor()
+        if not editor:
+            return False
+
+        if editor.file_path is None:
+            file_path, _ = QFileDialog.getSaveFileName(
+                self, "Save Python File", os.getcwd(), "Python Files (*.py);;All Files (*)"
+            )
+            if not file_path:
+                return False
+            editor.file_path = file_path
+
+        try:
+            with open(editor.file_path, "w", encoding="utf-8") as handle:
+                handle.write(editor.toPlainText())
+        except OSError as exc:
+            self.statusBar().showMessage(f"Save failed: {exc}", 5000)
+            return False
+
+        editor.document().setModified(False)
+        tab_name = os.path.basename(editor.file_path)
+        self.tab_widget.setTabText(self.tab_widget.currentIndex(), tab_name)
+        self.update_tab_title(editor)
+        self.add_to_recent_files(editor.file_path)
+        self.statusBar().showMessage(f"Saved: {editor.file_path}", 3000)
+        return True
+
+    def save_file_as(self):
+        editor = self.current_editor()
+        if not editor:
+            return False
+        editor.file_path = None
+        return self.save_file()
+
+    def add_to_recent_files(self, file_path):
+        if file_path in self.recent_files:
+            self.recent_files.remove(file_path)
+        self.recent_files.insert(0, file_path)
+        self.recent_files = self.recent_files[: self.RECENT_FILES_LIMIT]
+        self.save_recent_files()
 
     def save_recent_files(self):
-        """Save the recent files list to a JSON file."""
-        with open(self.RECENT_FILES_PATH, 'w') as file:
-            json.dump(self.recent_files, file)
+        try:
+            with open(RECENT_FILES_PATH, "w", encoding="utf-8") as handle:
+                json.dump(self.recent_files, handle, indent=2)
+        except OSError as exc:
+            logger.warning("Could not save recent files: %s", exc)
 
     def show_recent_files(self):
-        """Show the recent files menu."""
-        recent_files_menu = QMenu("Recent Files", self)
-        for file_path in self.recent_files:
-            recent_file_action = QAction(file_path, self)
-            recent_file_action.triggered.connect(lambda checked, path=file_path: self.load_file(path))
-            recent_files_menu.addAction(recent_file_action)
-        recent_files_menu.exec(self.mapToGlobal(self.toolbar.geometry().topLeft()))
+        menu = QMenu("Recent Files", self)
+        if not self.recent_files:
+            empty = QAction("(No recent files)", self)
+            empty.setEnabled(False)
+            menu.addAction(empty)
+        else:
+            for path in self.recent_files:
+                action = QAction(path, self)
+                action.triggered.connect(lambda checked=False, p=path: self._open_file_path(p))
+                menu.addAction(action)
+        menu.exec(self.menuBar().mapToGlobal(self.menuBar().rect().bottomLeft()))
+
+    def load_user_settings(self):
+        if not os.path.exists(SETTINGS_PATH):
+            return
+        try:
+            with open(SETTINGS_PATH, encoding="utf-8") as handle:
+                settings = json.load(handle)
+        except (json.JSONDecodeError, OSError):
+            return
+
+        font = QFont(
+            settings.get("font_family", "Consolas"),
+            settings.get("font_size", 12),
+        )
+        self.apply_font_settings(font)
+
+    def save_user_settings(self):
+        editor = self.current_editor()
+        font = editor.font() if editor else QFont("Consolas", 12)
+        settings = {
+            "font_family": font.family(),
+            "font_size": font.pointSize(),
+        }
+        with open(SETTINGS_PATH, "w", encoding="utf-8") as handle:
+            json.dump(settings, handle, indent=2)
 
     def open_font_dialog(self):
-        """Open a dialog to select font properties and apply them."""
-        font, ok = QFontDialog.getFont()
+        editor = self.current_editor()
+        current = editor.font() if editor else QFont("Consolas", 12)
+        font, ok = QFontDialog.getFont(current, self)
         if ok:
             self.apply_font_settings(font)
+            self.save_user_settings()
 
     def apply_font_settings(self, font):
-        """Apply the selected font to all editor components."""
         for index in range(self.tab_widget.count()):
             editor = self.tab_widget.widget(index)
             if isinstance(editor, CodeEditor):
                 editor.setFont(font)
-
         self.input_field.setFont(font)
         self.output_text.setFont(font)
 
     def create_new_folder(self):
-        """Create a new folder in the current directory."""
-        current_index = self.file_explorer.currentIndex()
-        current_path = self.file_model.filePath(current_index)
+        index = self.explorer_panel.tree.currentIndex()
+        base = self.explorer_panel.index_to_path(index)
+        folder_path = base if os.path.isdir(base) else os.path.dirname(base)
 
-        if os.path.isdir(current_path):
-            folder_path = current_path
-        else:
-            folder_path = os.path.dirname(current_path)
+        name, ok = QInputDialog.getText(self, "New Folder", "Folder name:")
+        if not ok or not name.strip():
+            return
 
-        folder_name, ok = QInputDialog.getText(self, "New Folder", "Enter folder name:")
-        if ok and folder_name:
-            new_folder_path = os.path.join(folder_path, folder_name)
-            try:
-                os.makedirs(new_folder_path)
-                self.statusBar().showMessage(f"Created folder: {new_folder_path}", 3000)
-                self.file_model.setRootPath(folder_path)
-            except Exception as e:
-                self.statusBar().showMessage(f"Error creating folder: {e}", 3000)
+        target = os.path.join(folder_path, name.strip())
+        try:
+            os.makedirs(target, exist_ok=False)
+            self.explorer_panel.refresh()
+            self.statusBar().showMessage(f"Created folder: {target}", 3000)
+        except OSError as exc:
+            self.statusBar().showMessage(f"Could not create folder: {exc}", 5000)
 
     def open_folder(self):
-        """Open a folder and set it as the root for the file explorer."""
-        folder_path = QFileDialog.getExistingDirectory(self, "Open Folder", "")
-        if folder_path:
-            self.file_model.setRootPath(folder_path)
-            self.file_explorer.setRootIndex(self.file_model.index(folder_path))
+        folder = QFileDialog.getExistingDirectory(self, "Open Folder", self._project_root)
+        if folder:
+            self.open_folder_at(folder)
 
-    def on_tab_changed(self, index):
-        """Handle actions when a tab changes."""
-        if self.previous_tab_index is not None and self.previous_tab_index != index:
-            current_editor = self.tab_widget.widget(self.previous_tab_index)
-            if isinstance(current_editor, CodeEditor) and current_editor.document().isModified():
-                self.save_file()
+    def format_document(self):
+        editor = self.current_editor()
+        if not editor:
+            return
+        self._run_format_worker(editor, mode="format")
 
-        self.previous_tab_index = index
+    def organize_imports(self):
+        editor = self.current_editor()
+        if not editor:
+            return
+        self._run_format_worker(editor, mode="imports")
+
+    def _run_format_worker(self, editor, mode="format"):
+        if self.format_worker and self.format_worker.isRunning():
+            self.format_worker.stop()
+
+        self.format_worker = FormatWorker(editor.toPlainText(), mode=mode)
+        self.format_worker.format_done.connect(
+            lambda text: self._apply_formatted_code(editor, text, mode)
+        )
+        self.format_worker.format_failed.connect(
+            lambda msg: self.statusBar().showMessage(f"Format failed: {msg}", 5000)
+        )
+        self.format_worker.start()
+        label = "Formatting" if mode == "format" else "Sorting imports"
+        self.statusBar().showMessage(f"{label}...", 2000)
+
+    def _apply_formatted_code(self, editor, text, mode):
+        if text and text != editor.toPlainText():
+            editor.setPlainText(text)
+            editor.document().setModified(True)
+            self.update_tab_title(editor)
+            editor.lint_code()
+        action = "Formatted" if mode == "format" else "Imports organized"
+        self.statusBar().showMessage(f"{action}.", 3000)
 
     def start_debugger(self):
-        """Start the debugger for the current code."""
-        current_editor = self.tab_widget.currentWidget()
-        if isinstance(current_editor, CodeEditor):
-            code = current_editor.toPlainText()
-            if not code.strip():
-                self.statusBar().showMessage("Error: No code to debug!", 3000)
-                return
+        editor = self.current_editor()
+        if not editor or not editor.toPlainText().strip():
+            self.statusBar().showMessage("No code to debug.", 3000)
+            return
 
-            # Stop the previous debugger thread if running
-            if hasattr(self, 'debugger_thread') and self.debugger_thread.isRunning():
-                self.debugger_thread.terminate()
-                self.debugger_thread.wait()
+        if self.debugger_thread and self.debugger_thread.isRunning():
+            self.debugger_thread.stop()
 
-            try:
-                # Start the new DebuggerThread
-                self.debugger_thread = DebuggerThread(code)
-                self.debugger_thread.output_received.connect(self.handle_output)
-                self.debugger_thread.error_received.connect(self.handle_error)
-                self.debugger_thread.start()
-                self.statusBar().showMessage("Debugger started successfully.", 3000)  # Inform user of success
-                logging.info("Debugger started for new code session")
-            except Exception as e:
-                self.statusBar().showMessage(f"Error starting debugger: {e}", 5000)  # Inform user of error
-                logging.error(f"Error starting debugger: {e}")
+        self.output_text.clear()
+        self.show_output_panel()
 
-    def handle_output(self, output, message_type="info"):
-        """Handle the output received and display it with appropriate colors in the output tab."""
-        self.output_text.moveCursor(QTextCursor.MoveOperation.End)  # Move cursor to the end
+        self.debugger_thread = DebuggerThread(
+            editor.toPlainText(),
+            breakpoints=editor.breakpoints,
+        )
+        self.debugger_thread.output_received.connect(
+            lambda msg: self.handle_output(msg, "info")
+        )
+        self.debugger_thread.error_received.connect(
+            lambda msg: self.handle_output(msg, "error")
+        )
+        self.debugger_thread.start()
 
-        # Determine color based on the message type
-        if message_type == "error":
-            color = "red"
-        elif message_type == "warning":
-            color = "yellow"
+        bp_count = len(editor.breakpoints)
+        if bp_count:
+            msg = f"Debugger started with {bp_count} breakpoint(s)."
         else:
-            color = "white"  # Default to white for info messages
-
-        # Insert the message into the output field with the selected color
-        self.output_text.insertPlainText(f'{output}\n')  # For plain text output
-
-    def handle_error(self, error):
-        """Handle the error received from running the tests or code."""
-        self.append_output(error)
+            msg = "Debugger started."
+        self.statusBar().showMessage(msg, 3000)
 
     def continue_debugger(self):
-        """Continue the execution in the debugger."""
-        if hasattr(self, 'debugger_thread'):
+        if self.debugger_thread:
             self.debugger_thread.send_command("continue")
 
     def step_debugger(self):
-        """Step through the code in the debugger."""
-        if hasattr(self, 'debugger_thread'):
+        if self.debugger_thread:
             self.debugger_thread.send_command("step")
 
     def open_file_from_explorer(self, index):
-        """Open a file from the file explorer."""
-        file_path = self.file_model.filePath(index)
-        if os.path.isfile(file_path) and file_path.endswith(".py"):
-            self.load_file(file_path)
-            self.add_to_recent_files(file_path)
-
-    def closeEvent(self, event):
-        """Ensure all threads are stopped before closing the application."""
-        # Shut down the ThreadPoolExecutor and wait for all tasks to finish
-        try:
-            self.thread_pool.shutdown(wait=True)  # No timeout in shutdown method
-        except Exception as e:
-            logging.error(f"Error shutting down thread pool: {e}")
-            self.statusBar().showMessage("Error shutting down thread pool. Please try again.", 5000)  # Inform user
-
-        # Wait for all QThreads to stop, with a manual timeout for thread termination
-        for thread in self.findChildren(QThread):
-            if thread.isRunning():
-                thread.quit()
-                thread.wait(5000)  # Wait for up to 5 seconds for each thread to stop
-
-        current_editor = self.tab_widget.currentWidget()
-        if isinstance(current_editor, CodeEditor):
-            # Ensure that lint worker or other QThreads are stopped
-            if hasattr(current_editor, 'lint_worker') and current_editor.lint_worker.isRunning():
-                current_editor.lint_worker.terminate()
-                current_editor.lint_worker.wait()
-            elif hasattr(current_editor, 'lint_timer'):
-                current_editor.lint_timer.stop()
-
-        event.accept()  # Ensure the event is accepted and the app closes
-
-    def save_session(self):
-        """Save the current session state."""
-        try:
-            session_data = {
-                "open_files": [],
-                "current_tab_index": self.tab_widget.currentIndex()
-            }
-
-            for i in range(self.tab_widget.count()):
-                editor = self.tab_widget.widget(i)
-                if isinstance(editor, CodeEditor):
-                    session_data["open_files"].append({
-                        "file_path": editor.file_path,
-                        "content": editor.toPlainText()
-                    })
-
-            with open(self.SESSION_PATH, 'w') as session_file:
-                json.dump(session_data, session_file)
-
-        except IOError as e:
-            self.statusBar().showMessage(f"Error saving session: {e.strerror}", 5000)  # More specific error message
-        except Exception as e:
-            self.statusBar().showMessage(f"An unexpected error occurred: {e}", 5000)
+        path = self.explorer_panel.index_to_path(index)
+        if not os.path.isfile(path):
+            return
+        ext = os.path.splitext(path)[1].lower()
+        if ext in (".py", ".txt", ".md", ".json", ".toml", ".cfg", ".ini", ".yaml", ".yml"):
+            self._open_file_path(path)
 
     def insert_snippet(self, code_snippet):
-        """Insert the provided code snippet into the current editor."""
-        current_editor = self.tab_widget.currentWidget()
-        if isinstance(current_editor, CodeEditor):
-            cursor = current_editor.textCursor()
-            cursor.insertText(code_snippet)
-            self.statusBar().showMessage("Snippet inserted", 3000)
-        else:
-            self.statusBar().showMessage("Error: No active code editor to insert the snippet.", 5000)
+        editor = self.current_editor()
+        if not editor:
+            self.statusBar().showMessage("No active editor.", 3000)
+            return
+        editor.textCursor().insertText(code_snippet)
+        self.statusBar().showMessage("Snippet inserted.", 2000)
 
     def run_batch_test(self):
-        """
-        Open a file dialog to choose the batch test file and run batch tests.
-        """
-        input_file, _ = QFileDialog.getOpenFileName(self, "Open Batch Test File", "", "Text Files (*.txt);;All Files (*)")
-
+        input_file, _ = QFileDialog.getOpenFileName(
+            self, "Open Batch Test File", os.getcwd(), "Text Files (*.txt);;All Files (*)"
+        )
         if input_file:
-            # You can replace 'self.sample_function' with any function you want to test
             self.batch_test(self.sample_function, input_file)
 
     def batch_test(self, function, input_file_path):
-        """Function to run batch tests for any provided function."""
-        results = []  # Initialize results list to store test results
+        self.output_text.clear()
+        self.show_output_panel()
+        results = []
+
         try:
-            with open(input_file_path, 'r') as file:
-                test_cases = file.readlines()
+            with open(input_file_path, encoding="utf-8") as handle:
+                test_cases = [line for line in handle if line.strip()]
+        except OSError as exc:
+            self.statusBar().showMessage(f"Could not read test file: {exc}", 5000)
+            return
 
-            if not test_cases:
-                self.statusBar().showMessage("No test cases found in the file.", 5000)
-                return
-
-            for i, case in enumerate(test_cases):
-                args = case.strip().split()
-
-                try:
-                    args = [int(arg) for arg in args]  # Convert inputs to integers
-                except ValueError:
-                    self.output_text.appendPlainText(f"Test case {i+1}: Invalid input format: {case.strip()}")
-                    continue
-
-                try:
-                    result = function(*args)
-                    results.append(f"Test case {i+1}: Input: {args} -> Output: {result}")
-                except Exception as e:
-                    results.append(f"Test case {i+1}: Input: {args} -> Error: {e}")
-
-                # Append results to the output window
-                self.output_text.appendPlainText(results[-1])
-
-            # New feature: Log results to a file
+        for i, case in enumerate(test_cases, start=1):
+            parts = case.strip().split()
             try:
-                with open("batch_test_results.txt", "w") as result_file:
-                    for result in results:
-                        result_file.write(result + "\n")  # Write each result to the file
-            except Exception as e:
-                self.statusBar().showMessage(f"Error saving results to file: {e}", 5000)
+                args = [int(arg) for arg in parts]
+                result = function(*args)
+                line = f"Test {i}: {args} -> {result}"
+            except ValueError:
+                line = f"Test {i}: invalid input {case.strip()!r}"
+            except Exception as exc:
+                line = f"Test {i}: error {exc}"
 
-        except FileNotFoundError:
-            self.statusBar().showMessage(f"Error: The file '{input_file_path}' does not exist.", 5000)
-        except Exception as e:
-            self.statusBar().showMessage(f"An error occurred: {e}", 5000)
+            results.append(line)
+            self.handle_output(line, "info")
 
-    # Sample function for batch testing
-    def sample_function(self, *args):
-        """ A sample function that takes arguments and returns their sum. """
+        try:
+            with open(BATCH_RESULTS_PATH, "w", encoding="utf-8") as handle:
+                handle.write("\n".join(results) + "\n")
+        except OSError as exc:
+            self.statusBar().showMessage(f"Could not save results: {exc}", 5000)
+
+    @staticmethod
+    def sample_function(*args):
         return sum(args)
 
-    def append_output(self, message, message_type="info"):
-        """Append text to the output field with different colors based on the message type."""
-        self.output_text.moveCursor(QTextCursor.MoveOperation.End)  # Move cursor to the end
+    def restore_session(self):
+        if not os.path.exists(SESSION_PATH):
+            return
 
-        # Determine the color based on the message type
-        if message_type == "error":
-            color = "red"
-        elif message_type == "warning":
-            color = "yellow"
-        else:
-            color = "white"  # Default color for info messages
+        try:
+            with open(SESSION_PATH, encoding="utf-8") as handle:
+                session_data = json.load(handle)
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning("Could not restore session: %s", exc)
+            return
 
-        # Insert the message into the output field with the selected color
-        self.output_text.insertPlainText(f'{message}\n')  # For plain text output
+        for file_info in session_data.get("open_files", []):
+            path = file_info.get("file_path")
+            content = file_info.get("content", "")
+            breakpoints = file_info.get("breakpoints", [])
 
-    def process_lint_results(self, lint_data):
-        """Process and display linting results in the Output Tab."""
-        # Clear previous output
-        self.output_text.clear()
-
-        for error in lint_data:
-            line_number = error['line'] - 1  # Convert to 0-based line number
-            message = error['message']
-
-            # Debugging: Print the raw message and line number
-            print(f"Processing lint result: Line {line_number + 1}, Message: {message}")
-
-            # Classify message as error or warning based on the message prefix
-            if message.startswith("E"):  # Error codes start with 'E'
-                message_type = "error"
-                self.handle_output(f"Error on line {line_number + 1}: {message}", message_type)
-            elif message.startswith("W") or message.startswith("F"):  # Warnings use 'W' or 'F' for some issues
-                message_type = "warning"
-                self.handle_output(f"Warning on line {line_number + 1}: {message}", message_type)
+            if path and os.path.isfile(path):
+                editor = self.add_new_tab(file_path=path, content=content)
+            elif content.strip():
+                editor = self.add_new_tab(content=content)
+                saved_name = file_info.get("untitled_name")
+                if saved_name:
+                    editor.untitled_name = saved_name
+                    self.update_tab_title(editor)
             else:
-                message_type = "info"
-                self.handle_output(f"Info on line {line_number + 1}: {message}", message_type)  # Default to info
+                continue
+
+            if breakpoints:
+                editor.breakpoints = set(breakpoints)
+                editor._refresh_breakpoints()
+
+        index = session_data.get("current_tab_index", 0)
+        if 0 <= index < self.tab_widget.count():
+            self.tab_widget.setCurrentIndex(index)
+
+    def save_session(self):
+        session_data = {
+            "open_files": [],
+            "current_tab_index": self.tab_widget.currentIndex(),
+        }
+
+        seen_untitled = set()
+        for index in range(self.tab_widget.count()):
+            editor = self.tab_widget.widget(index)
+            if isinstance(editor, CodeEditor):
+                text = editor.toPlainText()
+                if not editor.file_path:
+                    if not text.strip():
+                        continue
+                    key = hash(text)
+                    if key in seen_untitled:
+                        continue
+                    seen_untitled.add(key)
+                session_data["open_files"].append({
+                    "file_path": editor.file_path,
+                    "content": text,
+                    "breakpoints": sorted(editor.breakpoints),
+                    "untitled_name": getattr(editor, "untitled_name", None),
+                })
+
+        try:
+            with open(SESSION_PATH, "w", encoding="utf-8") as handle:
+                json.dump(session_data, handle, indent=2)
+        except OSError as exc:
+            logger.warning("Could not save session: %s", exc)
+
+    def closeEvent(self, event):
+        self.save_session()
+        self.save_user_settings()
+
+        if self.debugger_thread and self.debugger_thread.isRunning():
+            self.debugger_thread.stop()
+
+        if self.format_worker and self.format_worker.isRunning():
+            self.format_worker.stop()
+
+        for index in range(self.tab_widget.count()):
+            editor = self.tab_widget.widget(index)
+            if isinstance(editor, CodeEditor) and hasattr(editor, "lint_worker"):
+                if editor.lint_worker.isRunning():
+                    editor.lint_worker.stop()
+
+        if hasattr(self, "terminal_panel"):
+            self.terminal_panel.shutdown_all()
+
+        if hasattr(self, "fs_watcher"):
+            dirs = self.fs_watcher.directories()
+            files = self.fs_watcher.files()
+            if dirs:
+                self.fs_watcher.removePaths(dirs)
+            if files:
+                self.fs_watcher.removePaths(files)
+
+        for thread in self.findChildren(QThread):
+            if thread.isRunning():
+                thread.quit()
+                thread.wait(2000)
+
+        self.thread_pool.shutdown(wait=False, cancel_futures=True)
+        event.accept()
 
 
 if __name__ == "__main__":
     app = QApplication([])
-    main_win = AICompilerMainWindow()
-    main_win.show()
+    window = AICompilerMainWindow()
+    window.show()
     app.exec()
-

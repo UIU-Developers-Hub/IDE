@@ -1,90 +1,122 @@
-import sys
-import subprocess
-import queue
-import threading
 import logging
 import os
+import queue
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+
 from PyQt6.QtCore import QThread, pyqtSignal
 
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+from core.constants import DATA_DIR
+
+logger = logging.getLogger(__name__)
+
+PDB_COMMANDS = {
+    "continue": "c",
+    "step": "n",
+    "next": "n",
+    "quit": "q",
+}
+
 
 class DebuggerThread(QThread):
     output_received = pyqtSignal(str)
     error_received = pyqtSignal(str)
-    variable_value = pyqtSignal(str, str)
 
-    def __init__(self, code: str):
+    def __init__(self, code: str, breakpoints=None):
         super().__init__()
         self.code = code
+        self.breakpoints = frozenset(breakpoints or [])
         self.command_queue = queue.Queue()
         self.running = True
         self.process = None
+        self._temp_file = None
 
     def run(self):
-        temp_filename = "temp_debug_script.py"
         try:
-            with open(temp_filename, "w") as temp_file:
-                temp_file.write(self.code)
+            fd, self._temp_file = tempfile.mkstemp(suffix=".py", dir=DATA_DIR, text=True)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(self.code)
 
-            logging.info(f"Starting debugger for code in {temp_filename}")
+            logger.info("Starting debugger for %s", self._temp_file)
 
             self.process = subprocess.Popen(
-                [sys.executable, "-m", "pdb", temp_filename],
+                [sys.executable, "-m", "pdb", self._temp_file],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
             )
 
-            input_thread = threading.Thread(target=self.process_input)
-            input_thread.daemon = True
-            input_thread.start()
+            threading.Thread(target=self._process_input, daemon=True).start()
+            if self.breakpoints:
+                threading.Thread(target=self._apply_breakpoints, daemon=True).start()
 
-            for line in iter(self.process.stdout.readline, ''):
+            assert self.process.stdout is not None
+            for line in self.process.stdout:
                 if line:
-                    self.output_received.emit(line)
+                    self.output_received.emit(line.rstrip())
 
-            self.process.stdout.close()
             self.process.wait()
 
-        except Exception as e:
-            self.error_received.emit(str(e))
-            logging.error(f"Debugger error: {str(e)}")
+        except Exception as exc:
+            logger.exception("Debugger failed")
+            self.error_received.emit(str(exc))
         finally:
-            self._terminate_and_cleanup(temp_filename)
+            self._cleanup()
 
-    def process_input(self):
+    def _apply_breakpoints(self):
+        time.sleep(0.4)
+        if not self.process or not self.process.stdin:
+            return
+        for line in sorted(self.breakpoints):
+            try:
+                self.process.stdin.write(f"break {line + 1}\n")
+                self.process.stdin.flush()
+            except Exception as exc:
+                self.error_received.emit(f"Failed to set breakpoint: {exc}")
+
+    def _process_input(self):
         while self.running:
             try:
-                command = self.command_queue.get(timeout=1)
-                if command and self.process.stdin:
-                    logging.debug(f"Sending command to debugger: {command}")
-                    self.process.stdin.write(command + "\n")
-                    self.process.stdin.flush()
+                command = self.command_queue.get(timeout=0.5)
             except queue.Empty:
                 continue
-            except Exception as e:
-                self.error_received.emit(f"Failed to send command: {str(e)}")
+
+            if not command or not self.process or not self.process.stdin:
+                continue
+
+            pdb_cmd = PDB_COMMANDS.get(command.lower(), command)
+            try:
+                self.process.stdin.write(pdb_cmd + "\n")
+                self.process.stdin.flush()
+            except Exception as exc:
+                self.error_received.emit(f"Failed to send command: {exc}")
 
     def send_command(self, command: str):
         self.command_queue.put(command)
 
-    def _terminate_and_cleanup(self, temp_filename):
-        if self.process:
+    def _cleanup(self):
+        self.running = False
+
+        if self.process and self.process.poll() is None:
             try:
-                logging.debug(f"Terminating debugger process.")
                 self.process.terminate()
-            except Exception as e:
-                self.error_received.emit(f"Failed to terminate debugger: {str(e)}")
-        if os.path.exists(temp_filename):
-            logging.debug(f"Deleting temp file: {temp_filename}")
-            os.remove(temp_filename)
+                self.process.wait(2)
+            except Exception as exc:
+                logger.warning("Failed to terminate debugger: %s", exc)
+
+        if self._temp_file and os.path.exists(self._temp_file):
+            try:
+                os.remove(self._temp_file)
+            except OSError as exc:
+                logger.warning("Could not remove debug temp file: %s", exc)
 
     def stop(self):
         self.running = False
-        if self.process:
-            try:
-                self.process.terminate()
-                logging.info(f"Terminating debugger process.")
-            except Exception as e:
-                self.error_received.emit(f"Failed to terminate debugger: {str(e)}")
+        self.send_command("quit")
+        if self.isRunning():
+            self.wait(3000)

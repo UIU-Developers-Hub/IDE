@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+*.spec.bak
+
+# Virtual environments
+venv/
+.venv/
+env/
+myenv/
+newenv/
+test-env/
+.codegenome-env/
+
+# IDE / tooling
+.vscode/
+.idea/
+.genome/
+.coverage
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Runtime / user data
+data/recent_files.json
+data/recent_files.pkl
+data/last_session.json
+data/user_settings.json
+data/batch_test_results.txt
+recent_files.json
+recent_files.pkl
+last_session.json
+user_settings.json
+batch_test_results.txt
+temp_debug_script.py
+
+# OS
+Thumbs.db
+.DS_Store

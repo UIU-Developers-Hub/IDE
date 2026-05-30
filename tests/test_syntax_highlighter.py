@@ -1,11 +1,12 @@
-# File: tests/test_syntax_highlighter.py
-
 import unittest
-from ui.syntax_highlighter import PythonSyntaxHighlighter
+
 from PyQt6.QtGui import QTextDocument
 
-class TestSyntaxHighlighter(unittest.TestCase):
+import qt_helpers  # noqa: F401
+from ui.syntax_highlighter import PythonSyntaxHighlighter
 
+
+class TestSyntaxHighlighter(unittest.TestCase):
     def setUp(self):
         self.document = QTextDocument()
         self.highlighter = PythonSyntaxHighlighter(self.document)
@@ -13,7 +14,8 @@ class TestSyntaxHighlighter(unittest.TestCase):
     def test_highlight_python_code(self):
         code = "def test_function():\n    return True"
         self.document.setPlainText(code)
-        # You can extend this to check if highlighting rules were applied properly
+        self.assertEqual(self.document.toPlainText(), code)
+
 
 if __name__ == "__main__":
     unittest.main()
