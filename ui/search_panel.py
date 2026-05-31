@@ -2,7 +2,7 @@ import os
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QVBoxLayout, QWidget
-from qfluentwidgets import CaptionLabel, ListWidget, SearchLineEdit
+from qfluentwidgets import ListWidget, SearchLineEdit
 
 from ui.sidebar_common import ElideMiddleDelegate, SIDEBAR_PAD
 from ui.theme import BG_SIDEBAR
@@ -17,12 +17,8 @@ class SearchPanel(QWidget):
         self._root = main_window._project_root
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(SIDEBAR_PAD, 8, SIDEBAR_PAD, 8)
+        layout.setContentsMargins(SIDEBAR_PAD, 10, SIDEBAR_PAD, 8)
         layout.setSpacing(8)
-
-        header = CaptionLabel("SEARCH")
-        header.setStyleSheet("font-weight: bold; letter-spacing: 1px;")
-        layout.addWidget(header)
 
         self.query = SearchLineEdit()
         self.query.setPlaceholderText("Search in files...")

@@ -35,6 +35,7 @@ data/recent_files.pkl
 data/last_session.json
 data/user_settings.json
 data/batch_test_results.txt
+data/local_history/
 recent_files.json
 recent_files.pkl
 last_session.json

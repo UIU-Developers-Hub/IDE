@@ -29,9 +29,20 @@ FA_MAP = {
     "explorer": "fa5s.folder",
     "settings": "fa5s.cog",
     "close": "fa5s.times",
+    "plus": "fa5s.plus",
     "git": "fa5s.code-branch",
     "files": "fa5s.file-code",
     "batch": "fa5s.list-ol",
+    "sidebar": "fa5s.th-large",
+    "back": "fa5s.arrow-left",
+    "forward": "fa5s.arrow-right",
+    "panel": "fa5s.terminal",
+    "comment": "fa5s.comment-alt",
+    "logo": "fa5s.cube",
+    "win-minimize": "win-minimize.svg",
+    "win-maximize": "win-maximize.svg",
+    "win-restore": "win-restore.svg",
+    "win-close": "win-close.svg",
 }
 
 
@@ -41,10 +52,12 @@ def _svg_icon(name: str) -> QIcon:
 
 
 def icon(name: str, color: str = DEFAULT_COLOR) -> QIcon:
-    fa_name = FA_MAP.get(name)
-    if fa_name:
+    mapped = FA_MAP.get(name)
+    if mapped:
+        if mapped.endswith(".svg"):
+            return _svg_icon(mapped)
         try:
-            return qta.icon(fa_name, color=color)
+            return qta.icon(mapped, color=color)
         except Exception as exc:
             logger.debug("qtawesome icon failed for %s: %s", name, exc)
 

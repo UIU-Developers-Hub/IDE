@@ -5,7 +5,7 @@ from PyQt6.QtWidgets import (
     QGridLayout, QHBoxLayout, QLabel, QListWidget, QListWidgetItem,
     QSizePolicy, QVBoxLayout, QWidget,
 )
-from qfluentwidgets import CaptionLabel, LineEdit, PrimaryPushButton, PushButton
+from qfluentwidgets import LineEdit, PrimaryPushButton, PushButton
 
 from core.git_service import GitService
 from ui.icons_util import icon
@@ -32,17 +32,15 @@ class SourceControlPanel(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
 
-        header = QWidget()
-        header_layout = QHBoxLayout(header)
-        header_layout.setContentsMargins(SIDEBAR_PAD, 10, SIDEBAR_PAD, 0)
-        title = CaptionLabel("SOURCE CONTROL")
-        title.setStyleSheet("font-weight: bold; letter-spacing: 0.5px;")
+        toolbar = QWidget()
+        toolbar_layout = QHBoxLayout(toolbar)
+        toolbar_layout.setContentsMargins(SIDEBAR_PAD, 8, SIDEBAR_PAD, 0)
         refresh_btn = PushButton("Refresh")
         refresh_btn.setFixedHeight(26)
         refresh_btn.clicked.connect(self.refresh)
-        header_layout.addWidget(title, 1)
-        header_layout.addWidget(refresh_btn, 0)
-        layout.addWidget(header)
+        toolbar_layout.addStretch()
+        toolbar_layout.addWidget(refresh_btn, 0)
+        layout.addWidget(toolbar)
 
         self.branch_label = QLabel("")
         self.branch_label.setStyleSheet(

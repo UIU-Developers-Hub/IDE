@@ -13,12 +13,8 @@ class RunPanel(QWidget):
         self.main_window = main_window
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 8, 12, 12)
+        layout.setContentsMargins(12, 10, 12, 12)
         layout.setSpacing(8)
-
-        header = CaptionLabel("RUN AND DEBUG")
-        header.setStyleSheet("font-weight: bold; letter-spacing: 1px;")
-        layout.addWidget(header)
 
         run_btn = PrimaryPushButton("  Run Python File")
         run_btn.setIcon(icon("run"))

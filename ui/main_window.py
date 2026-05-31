@@ -5,7 +5,7 @@ import sys
 
 import jedi
 from concurrent.futures import ThreadPoolExecutor
-from PyQt6.QtCore import Qt, QThread, QFileSystemWatcher, QSize
+from PyQt6.QtCore import Qt, QThread, QFileSystemWatcher, QSize, QTimer
 from PyQt6.QtGui import (
     QAction, QColor, QFont, QKeySequence, QShortcut, QTextCharFormat,
     QTextCursor,
@@ -32,10 +32,13 @@ from ui.documentation_sidebar import DocumentationSidebar
 from ui.problems_panel import ProblemsPanel
 from ui.quick_open import QuickOpenDialog
 from ui.side_bar import SideBar
+from ui.title_bar import TitleBar
 from ui.terminal_panel import TerminalPanel
 from ui.welcome_widget import WelcomeWidget
 from core.git_service import GitService
-from ui.theme import ERROR, WARNING, SIDEBAR_WIDTH
+from ui.theme import (
+    ERROR, WARNING, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH, SIDEBAR_WIDTH,
+)
 from ui.icons_util import icon
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -70,9 +73,12 @@ class AICompilerMainWindow(QMainWindow):
         self._last_activity = ActivityBar.EXPLORER
         self._untitled_seq = 0
         self._docs_visible = False
+        self._nav_history: list[int] = []
+        self._nav_index = -1
+        self._nav_lock = False
 
+        self._enable_custom_title_bar()
         self.setup_ui()
-        self.setup_menu_bar()
         self.setup_shortcuts()
         self.load_user_settings()
         self.restore_session()
@@ -80,15 +86,29 @@ class AICompilerMainWindow(QMainWindow):
         if self.tab_widget.count() == 0:
             self.show_welcome_tab()
 
+    def _enable_custom_title_bar(self):
+        """Replace the native Windows title bar with the Cursor-style menu bar."""
+        self.menuBar().setVisible(False)
+        if sys.platform == "win32":
+            self.setWindowFlags(
+                Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint
+            )
+
+    def _toggle_maximize(self):
+        if self.isMaximized():
+            self.showNormal()
+        else:
+            self.showMaximized()
+        if hasattr(self, "title_bar"):
+            self.title_bar.update_maximize_icon(self.isMaximized())
+
     def setup_ui(self):
         self.recent_files = self.load_recent_files()
-
-        self.activity_bar = ActivityBar(self)
-        self.activity_bar.view_changed.connect(self._on_activity_view)
 
         self.setup_status_bar()
 
         self.side_bar = SideBar(self)
+        self.side_bar.view_changed.connect(self._on_activity_view)
         self.side_bar.set_root(self._project_root)
         self.explorer_panel = self.side_bar.explorer_panel
 
@@ -105,6 +125,7 @@ class AICompilerMainWindow(QMainWindow):
         tab_bar.setElideMode(Qt.TextElideMode.ElideRight)
         tab_bar.setDrawBase(False)
         self.tab_widget.currentChanged.connect(self._on_tab_changed)
+        self._setup_new_tab_button()
 
         self.setup_bottom_panel()
 
@@ -120,23 +141,32 @@ class AICompilerMainWindow(QMainWindow):
         editor_splitter.setSizes([700, 220])
         self._editor_splitter = editor_splitter
 
-        # Activity bar sits outside the splitter — fixed width, never draggable.
         self._main_splitter = QSplitter(Qt.Orientation.Horizontal)
         self._main_splitter.addWidget(self.side_bar)
         self._main_splitter.addWidget(editor_splitter)
         self._main_splitter.setStretchFactor(0, 0)
         self._main_splitter.setStretchFactor(1, 1)
+        self._main_splitter.setHandleWidth(4)
         self._main_splitter.setSizes([SIDEBAR_WIDTH, 900])
         self._main_splitter.setCollapsible(0, False)
         self._main_splitter.setChildrenCollapsible(False)
 
-        central_widget = QWidget()
-        layout = QHBoxLayout(central_widget)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
-        layout.addWidget(self.activity_bar)
-        layout.addWidget(self._main_splitter)
-        self.setCentralWidget(central_widget)
+        self._outline_timer = QTimer(self)
+        self._outline_timer.setSingleShot(True)
+        self._outline_timer.setInterval(400)
+        self._outline_timer.timeout.connect(
+            lambda: self.side_bar.footer.outline.refresh()
+        )
+
+        self.title_bar = TitleBar(self)
+
+        shell = QWidget()
+        shell_layout = QVBoxLayout(shell)
+        shell_layout.setContentsMargins(0, 0, 0, 0)
+        shell_layout.setSpacing(0)
+        shell_layout.addWidget(self.title_bar)
+        shell_layout.addWidget(self._main_splitter, 1)
+        self.setCentralWidget(shell)
 
         self.update_git_status()
         self.bottom_panel.tab_changed.connect(self._on_bottom_panel_tab_changed)
@@ -181,7 +211,6 @@ class AICompilerMainWindow(QMainWindow):
         self._sidebar_visible = True
         self.side_bar.show()
         self.side_bar.show_view(index)
-        self.activity_bar.set_active(index)
 
     def toggle_side_bar(self, force_hide=None):
         if force_hide is True:
@@ -275,102 +304,6 @@ class AICompilerMainWindow(QMainWindow):
         status.addPermanentWidget(self._status_encoding)
         status.addPermanentWidget(self._status_language)
 
-    def setup_menu_bar(self):
-        mb = self.menuBar()
-
-        file_menu = mb.addMenu("&File")
-        for label, shortcut, slot in (
-            ("&New File", "Ctrl+N", self.add_new_tab),
-            ("&Open File...", "Ctrl+O", self.open_file),
-            ("&Quick Open...", "Ctrl+P", self.show_quick_open),
-            ("Command &Palette...", "Ctrl+Shift+P", self.show_command_palette),
-            ("&Save", "Ctrl+S", self.save_file),
-            ("Save &As...", "Ctrl+Shift+S", self.save_file_as),
-            ("Open &Folder...", "Ctrl+Shift+O", self.open_folder),
-            ("&Recent Files", None, self.show_recent_files),
-        ):
-            action = QAction(label, self)
-            if shortcut:
-                action.setShortcut(shortcut)
-            action.triggered.connect(slot)
-            file_menu.addAction(action)
-        file_menu.addSeparator()
-        exit_action = QAction("E&xit", self)
-        exit_action.setShortcut("Ctrl+Q")
-        exit_action.triggered.connect(QApplication.instance().quit)
-        file_menu.addAction(exit_action)
-
-        edit_menu = mb.addMenu("&Edit")
-        for label, shortcut, slot in (
-            ("&Find", "Ctrl+F", self.show_find_dialog),
-            ("&Replace", "Ctrl+H", self.show_replace_dialog),
-            ("&Go to Line", "Ctrl+G", self.show_go_to_line),
-            ("Toggle &Comment", "Ctrl+/", self.toggle_comment),
-            ("&Format Document", "Shift+Alt+F", self.format_document),
-            ("Organize &Imports", "Ctrl+Alt+I", self.organize_imports),
-        ):
-            action = QAction(label, self)
-            action.setShortcut(shortcut)
-            action.triggered.connect(slot)
-            edit_menu.addAction(action)
-
-        run_menu = mb.addMenu("&Run")
-        for label, shortcut, slot in (
-            ("&Run File", "F5", self.run_code),
-            ("&Stop", "Shift+F5", self.stop_execution),
-            ("Run &Buffer", "Ctrl+T", self.run_tests),
-        ):
-            action = QAction(label, self)
-            action.setShortcut(shortcut)
-            action.triggered.connect(slot)
-            run_menu.addAction(action)
-
-        debug_menu = mb.addMenu("&Debug")
-        for label, slot in (
-            ("Start Debugger", self.start_debugger),
-            ("Continue", self.continue_debugger),
-            ("Step", self.step_debugger),
-        ):
-            action = QAction(label, self)
-            action.triggered.connect(slot)
-            debug_menu.addAction(action)
-
-        git_menu = mb.addMenu("&Git")
-        for label, shortcut, slot in (
-            ("&Source Control", "Ctrl+Shift+G", lambda: self._show_activity(ActivityBar.SOURCE_CONTROL)),
-            ("&Commit...", "Ctrl+Enter", self._git_commit_prompt),
-            ("&Push", "Ctrl+Shift+K", self._git_push),
-            ("P&ull", "Ctrl+Shift+U", self._git_pull),
-            ("&Refresh Status", None, self._git_refresh),
-            ("Clone Repository...", None, self.side_bar.source_control_panel.clone_repo),
-            ("Publish to GitHub...", None, self.side_bar.source_control_panel.publish_github),
-        ):
-            action = QAction(label, self)
-            if shortcut:
-                action.setShortcut(shortcut)
-            action.triggered.connect(slot)
-            git_menu.addAction(action)
-
-        view_menu = mb.addMenu("&View")
-        for label, shortcut, slot in (
-            ("&Explorer", "Ctrl+Shift+E", lambda: self._show_activity(ActivityBar.EXPLORER)),
-            ("&Search", "Ctrl+Shift+F", lambda: self._show_activity(ActivityBar.SEARCH)),
-            ("Source &Control", "Ctrl+Shift+G", lambda: self._show_activity(ActivityBar.SOURCE_CONTROL)),
-            ("&Run and Debug", None, lambda: self._show_activity(ActivityBar.RUN)),
-            ("&Terminal", "Ctrl+`", self.toggle_terminal),
-            ("New &Terminal", "Ctrl+Shift+`", self.new_terminal),
-            ("Toggle &Documentation", "Ctrl+Shift+I", self.toggle_documentation),
-            ("Toggle &Side Bar", "Ctrl+B", self.toggle_side_bar),
-            ("Toggle &Panel", "Ctrl+J", self.toggle_bottom_panel),
-            ("Show &Problems", "Ctrl+Shift+M", self.show_problems_panel),
-            ("Clear &Output", None, self.clear_output),
-        ):
-            action = QAction(label, self)
-            if shortcut:
-                action.setShortcut(shortcut)
-            action.triggered.connect(slot)
-            view_menu.addAction(action)
-
     def _show_activity(self, index):
         self._on_activity_view(index)
 
@@ -425,6 +358,22 @@ class AICompilerMainWindow(QMainWindow):
     def _next_untitled_name(self):
         self._untitled_seq += 1
         return f"Untitled-{self._untitled_seq}"
+
+    def _setup_new_tab_button(self):
+        btn = QToolButton()
+        btn.setObjectName("NewTabButton")
+        btn.setIcon(icon("plus", "#969696"))
+        btn.setIconSize(QSize(14, 14))
+        btn.setFixedSize(36, 36)
+        btn.setToolTip("New Tab (Ctrl+N)")
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.clicked.connect(self.add_new_tab)
+        btn.setStyleSheet(
+            "QToolButton#NewTabButton { background: transparent; border: none; "
+            "border-radius: 4px; margin-right: 4px; }"
+            "QToolButton#NewTabButton:hover { background: #3e3e42; }"
+        )
+        self.tab_widget.setCornerWidget(btn, Qt.Corner.TopRightCorner)
 
     def _add_tab_close_button(self, index):
         bar = self.tab_widget.tabBar()
@@ -510,6 +459,9 @@ class AICompilerMainWindow(QMainWindow):
         QShortcut(QKeySequence("Ctrl+Shift+M"), self, activated=self.show_problems_panel)
         QShortcut(QKeySequence("Ctrl+Shift+P"), self, activated=self.show_command_palette)
         QShortcut(QKeySequence("Ctrl+Shift+I"), self, activated=self.toggle_documentation)
+        QShortcut(QKeySequence("Alt+Left"), self, activated=self.navigate_back)
+        QShortcut(QKeySequence("Alt+Right"), self, activated=self.navigate_forward)
+        QShortcut(QKeySequence("Ctrl+A"), self, activated=self.select_all)
         QShortcut(QKeySequence("Ctrl+P"), self, activated=self.show_quick_open)
         QShortcut(QKeySequence("Ctrl+Shift+L"), self, activated=self.show_lint_report)
         QShortcut(QKeySequence("Shift+Alt+F"), self, activated=self.format_document)
@@ -553,12 +505,66 @@ class AICompilerMainWindow(QMainWindow):
         except OSError as exc:
             self.statusBar().showMessage(f"Reload failed: {exc}", 5000)
 
-    def _on_tab_changed(self, _index):
+    def _on_tab_changed(self, index):
+        if index >= 0:
+            self._record_navigation(index)
         editor = self.current_editor()
         if editor:
             self.update_documentation(editor)
             self.update_status_bar(editor)
             self.update_tab_title(editor)
+        self._refresh_sidebar_footer()
+
+    def _record_navigation(self, tab_index: int):
+        if self._nav_lock:
+            return
+        if self._nav_index >= 0 and self._nav_history[self._nav_index] == tab_index:
+            return
+        self._nav_history = self._nav_history[: self._nav_index + 1]
+        self._nav_history.append(tab_index)
+        self._nav_index = len(self._nav_history) - 1
+        self._update_nav_buttons()
+
+    def _update_nav_buttons(self):
+        if hasattr(self, "title_bar"):
+            self.title_bar.update_nav_buttons(
+                self._nav_index > 0,
+                self._nav_index < len(self._nav_history) - 1,
+            )
+
+    def navigate_back(self):
+        if self._nav_index <= 0:
+            return
+        self._nav_lock = True
+        self._nav_index -= 1
+        self.tab_widget.setCurrentIndex(self._nav_history[self._nav_index])
+        self._nav_lock = False
+        self._update_nav_buttons()
+
+    def navigate_forward(self):
+        if self._nav_index >= len(self._nav_history) - 1:
+            return
+        self._nav_lock = True
+        self._nav_index += 1
+        self.tab_widget.setCurrentIndex(self._nav_history[self._nav_index])
+        self._nav_lock = False
+        self._update_nav_buttons()
+
+    def select_all(self):
+        editor = self.current_editor()
+        if editor:
+            editor.selectAll()
+
+    def _schedule_outline_refresh(self):
+        self._outline_timer.start()
+
+    def _refresh_sidebar_footer(self):
+        if hasattr(self, "side_bar"):
+            self.side_bar.footer.refresh()
+
+    def _sidebar_width(self):
+        sizes = self._main_splitter.sizes()
+        return max(SIDEBAR_MIN_WIDTH, min(SIDEBAR_MAX_WIDTH, sizes[0])) if sizes else SIDEBAR_WIDTH
 
     def update_status_bar(self, editor):
         line, col = editor.getCursorPosition()
@@ -638,7 +644,9 @@ class AICompilerMainWindow(QMainWindow):
         editor.document().modificationChanged.connect(
             lambda _modified: self.update_tab_title(editor)
         )
+        editor.textChanged.connect(self._schedule_outline_refresh)
         self.update_status_bar(editor)
+        self._refresh_sidebar_footer()
         return editor
 
     def close_current_tab(self):
@@ -932,6 +940,10 @@ class AICompilerMainWindow(QMainWindow):
         self.tab_widget.setTabText(self.tab_widget.currentIndex(), tab_name)
         self.update_tab_title(editor)
         self.add_to_recent_files(editor.file_path)
+        self.side_bar.footer.timeline._history.record_save(
+            editor.file_path, editor.toPlainText()
+        )
+        self._refresh_sidebar_footer()
         self.statusBar().showMessage(f"Saved: {editor.file_path}", 3000)
         return True
 
@@ -967,7 +979,11 @@ class AICompilerMainWindow(QMainWindow):
                 action = QAction(path, self)
                 action.triggered.connect(lambda checked=False, p=path: self._open_file_path(p))
                 menu.addAction(action)
-        menu.exec(self.menuBar().mapToGlobal(self.menuBar().rect().bottomLeft()))
+        btn = self.title_bar.menu_button("File")
+        if btn:
+            menu.exec(btn.mapToGlobal(btn.rect().bottomLeft()))
+        else:
+            menu.exec(self.title_bar.mapToGlobal(self.title_bar.rect().bottomLeft()))
 
     def load_user_settings(self):
         if not os.path.exists(SETTINGS_PATH):
@@ -984,12 +1000,18 @@ class AICompilerMainWindow(QMainWindow):
         )
         self.apply_font_settings(font)
 
+        width = settings.get("sidebar_width", SIDEBAR_WIDTH)
+        width = max(SIDEBAR_MIN_WIDTH, min(SIDEBAR_MAX_WIDTH, int(width)))
+        total = max(self.width(), width + 400)
+        self._main_splitter.setSizes([width, total - width])
+
     def save_user_settings(self):
         editor = self.current_editor()
         font = editor.font() if editor else QFont("Consolas", 12)
         settings = {
             "font_family": font.family(),
             "font_size": font.pointSize(),
+            "sidebar_width": self._sidebar_width(),
         }
         with open(SETTINGS_PATH, "w", encoding="utf-8") as handle:
             json.dump(settings, handle, indent=2)

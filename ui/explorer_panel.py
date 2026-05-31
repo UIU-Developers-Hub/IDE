@@ -5,13 +5,15 @@ from PyQt6.QtGui import QAction, QFileSystemModel
 from PyQt6.QtWidgets import (
     QHBoxLayout, QLabel, QMenu, QTreeView, QVBoxLayout, QWidget,
 )
-from qfluentwidgets import SearchLineEdit, TransparentToolButton, FluentIcon
+from qfluentwidgets import TransparentToolButton, FluentIcon
 
+from ui.explorer_delegate import ExplorerItemDelegate
+from ui.sidebar_section import SidebarSectionHeader
 from ui.theme import BG_SIDEBAR, FG_HEADER
 
 
 class ExplorerPanel(QWidget):
-    """VS Code Explorer view — names only, no size/type columns."""
+    """VS Code Explorer — section header, workspace tree, fills sidebar."""
 
     def __init__(self, main_window):
         super().__init__()
@@ -22,35 +24,31 @@ class ExplorerPanel(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        header = QWidget()
-        header.setStyleSheet(f"background: {BG_SIDEBAR};")
-        header_layout = QVBoxLayout(header)
-        header_layout.setContentsMargins(12, 10, 8, 6)
-        header_layout.setSpacing(6)
+        header_row = QWidget()
+        header_layout = QHBoxLayout(header_row)
+        header_layout.setContentsMargins(12, 10, 8, 4)
 
-        title_row = QWidget()
-        row = QHBoxLayout(title_row)
-        row.setContentsMargins(0, 0, 0, 0)
         title = QLabel("EXPLORER")
         title.setStyleSheet(
-            f"color: {FG_HEADER}; font-size: 11px; font-weight: 600; letter-spacing: 0.5px;"
+            f"color: {FG_HEADER}; font-size: 11px; font-weight: 600; "
+            f"letter-spacing: 0.6px;"
         )
+        header_layout.addWidget(title)
+        header_layout.addStretch()
+
         refresh_btn = TransparentToolButton(FluentIcon.SYNC)
         refresh_btn.setFixedSize(22, 22)
         refresh_btn.setToolTip("Refresh Explorer")
         refresh_btn.clicked.connect(self.refresh)
-        row.addWidget(title)
-        row.addStretch()
-        row.addWidget(refresh_btn)
-        header_layout.addWidget(title_row)
+        header_layout.addWidget(refresh_btn)
+        layout.addWidget(header_row)
 
-        self.filter_input = SearchLineEdit()
-        self.filter_input.setPlaceholderText("Filter files...")
-        self.filter_input.setClearButtonEnabled(True)
-        self.filter_input.textChanged.connect(self._apply_filter)
-        header_layout.addWidget(self.filter_input)
-        layout.addWidget(header)
+        self.workspace_header = SidebarSectionHeader()
+        self.workspace_header.set_title(self._root)
+        self.workspace_header.toggled.connect(self._on_workspace_toggle)
+        layout.addWidget(self.workspace_header)
 
+        self.tree = QTreeView()
         self.file_model = QFileSystemModel()
         self.file_model.setRootPath("")
         self.file_model.setFilter(
@@ -62,25 +60,26 @@ class ExplorerPanel(QWidget):
         self.proxy.setFilterCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
         self.proxy.setFilterKeyColumn(0)
 
-        self.tree = QTreeView()
         self.tree.setModel(self.proxy)
-        self.tree.setRootIndex(self.proxy.mapFromSource(self.file_model.index(self._root)))
+        self._apply_tree_root(self._root)
         self.tree.setHeaderHidden(True)
         self.tree.setAnimated(True)
         self.tree.setIndentation(14)
-        self.tree.setIconSize(self.tree.iconSize())
         self.tree.setUniformRowHeights(True)
         self.tree.setTextElideMode(Qt.TextElideMode.ElideMiddle)
         self.tree.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.tree.setItemDelegate(
+            ExplorerItemDelegate(self.proxy, self.file_model, self.tree)
+        )
         self.tree.setStyleSheet(f"""
             QTreeView {{
                 background: {BG_SIDEBAR};
                 border: none;
-                padding: 4px 0;
+                padding: 0 0 4px 0;
             }}
             QTreeView::item {{
                 height: 22px;
-                padding: 0 8px;
+                padding: 0 4px 0 0;
             }}
         """)
         self.tree.clicked.connect(main_window.open_file_from_explorer)
@@ -91,6 +90,14 @@ class ExplorerPanel(QWidget):
 
         for col in range(1, self.file_model.columnCount()):
             self.tree.setColumnHidden(col, True)
+
+    def _apply_tree_root(self, path):
+        self.file_model.setRootPath(path)
+        source_index = self.file_model.index(path)
+        self.tree.setRootIndex(self.proxy.mapFromSource(source_index))
+
+    def _on_workspace_toggle(self, expanded):
+        self.tree.setVisible(expanded)
 
     def _show_context_menu(self, pos):
         index = self.tree.indexAt(pos)
@@ -120,20 +127,13 @@ class ExplorerPanel(QWidget):
 
     def set_root(self, path):
         self._root = path
-        self.file_model.setRootPath(path)
-        source_index = self.file_model.index(path)
-        self.tree.setRootIndex(self.proxy.mapFromSource(source_index))
+        self.workspace_header.set_title(path)
+        self._apply_tree_root(path)
 
     def refresh(self):
         path = self._root
         self.file_model.setRootPath("")
-        self.file_model.setRootPath(path)
-        self.tree.setRootIndex(
-            self.proxy.mapFromSource(self.file_model.index(path))
-        )
-
-    def _apply_filter(self, text):
-        self.proxy.setFilterFixedString(text)
+        self._apply_tree_root(path)
 
     def index_to_path(self, proxy_index):
         source_index = self.proxy.mapToSource(proxy_index)
